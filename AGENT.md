@@ -49,7 +49,8 @@ host. Keep the allow list short.
 ## Docker
 
 The image contains the `docker` CLI and the compose plugin, but no daemon. To
-let the agent inspect or manage containers, mount the host socket:
+let the agent inspect or manage containers, mount the host socket. This gives
+the agent full control of every container on the host:
 
 ```yaml
     volumes:
@@ -58,16 +59,61 @@ let the agent inspect or manage containers, mount the host socket:
 
 ## Helper commands
 
-A 4B model cannot work out how to query an image registry, so jobs like that
-are shipped as commands the model only has to run and summarise.
+A 4B model cannot work out how to query a registry or edit YAML safely, so
+those jobs are shipped as commands the model only has to run and summarise.
 
-- `image-updates [compose-file]` lists newer tags for every `image:` in a
-  compose file and every `FROM` / `COPY --from` in its build contexts. Tags
-  are only compared like-for-like (`3.3.17` with `3.3.19` and `3.4.2`, never
-  with `3.4-alpine`); `latest` and other non-version tags are reported as not
-  checked. Default file: `/root/compose/docker-compose.yml`.
+### `image-updates [--no-cves] [compose-file]`
 
-Tell the agent about a helper once with `/note`, or name it in a task.
+Read-only report; it never changes a file, image or container.
+
+- **Version tags** (`haproxy:3.3.17`): newer tags of the same shape (`3.3.19`
+  and `3.4.2`, never `3.4-alpine`).
+- **Any tag, including `latest`**: whether the registry now serves a different
+  image for that tag than the one on the host.
+- **Services with a build context**: the `FROM` and `COPY --from` images of
+  the Dockerfile, both for newer versions and for a base image republished
+  after the local build.
+- **Critical CVEs** with a fix available, counted by Trivy for every service
+  image, including locally built ones.
+
+Without Docker access only the version-tag check and CVE scans of public
+registry images work; the report says what was skipped. Trivy keeps its
+database and layer cache in the agent volume (`trivy/`), so the first run is
+slow and later runs are quick. A run stops scanning after
+`IMAGE_UPDATES_BUDGET` seconds (780) and reports the rest as not scanned;
+running it again continues from the cache.
+
+### `image-apply [--dry-run] <image-or-service> [new-tag] [compose-file]`
+
+The only command that changes anything. Run it for one image you named.
+
+```
+image-apply haproxy:3.3.17 3.4.7        # edit the compose file, pull, recreate
+image-apply python:3.12-slim 3.13-slim  # edit the Dockerfile, rebuild, recreate
+image-apply grafana/grafana             # same tag: pull the newest, recreate
+```
+
+- Every file it edits is first copied to `<file>.bak-YYYYmmdd-HHMMSS`.
+- The new tag is checked against the registry before anything is touched.
+- It refuses to recreate the container the agent itself runs in.
+- If pull, build or `up -d` fails it says so and names the backups.
+
+It needs the Docker socket, the compose directory mounted **read-write**, and
+the directory mounted at the same path as on the host (`/root/compose` on
+both), so that relative paths in the compose file mean the same thing.
+
+```yaml
+    volumes:
+      - /root/compose:/root/compose
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Tell the agent about the helpers once:
+
+```
+/note To check for image updates and CVEs run: image-updates
+/note To apply an update the user asked for run: image-apply <image> <new-tag>. Never run it for anything else.
+```
 
 ## Commands
 
@@ -77,7 +123,8 @@ the model.
 - `/new` starts a new conversation
 - `/status` shows the model, history size and tasks
 - `/note <text>` remembers something; `/notes` shows what is remembered
-- `/task list`
+- `/task list` (also `/tasks`)
+- anything else starting with `/word` returns the command help
 - `/task add <name> <schedule> | <instructions>`
 - `/task show <name>`, `/task run <name>`, `/task rm <name>`
 
@@ -121,7 +168,7 @@ local time, set `TZ`). A new task first runs at its next scheduled time; use
 | `AGENT_NOTIFY_TO` | self chat | phone number that receives scheduled task reports |
 | `AGENT_SYSTEM_PROMPT` | ops assistant | system prompt; keep it short and constant |
 | `AGENT_MAX_STEPS` | `8` | model calls per message |
-| `AGENT_TOOL_TIMEOUT` | `120` | seconds per shell command |
+| `AGENT_TOOL_TIMEOUT` | `900` | seconds per shell command |
 | `AGENT_TOOL_OUTPUT_CHARS` | `3000` | shell output kept (head and tail) |
 | `AGENT_NOTES_CHARS` | `2000` | notes included in the prompt (most recent part) |
 | `AGENT_HISTORY_CHARS` | `24000` | history size that triggers a new conversation |

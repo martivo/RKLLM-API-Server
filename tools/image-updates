@@ -1,53 +1,96 @@
 #!/usr/bin/env python3
-"""List newer tags for the images a docker compose file uses.
+"""Report image updates and critical CVEs for a docker compose file.
 
-    image-updates [compose-file]
+    image-updates [--no-cves] [compose-file]
 
-Checks every `image:` line and every `FROM` line of the Dockerfiles in the
-compose file's build contexts against the image's registry.  A tag is only
-compared with tags of the same shape (3.3.17 with 3.3.19 and 3.4.2, never with
-3.4-alpine), so the suggestion is always a like-for-like replacement.
+For every service it checks:
 
-The output is short on purpose: it is meant to be read by a small local model.
+- version tags (haproxy:3.3.17): newer tags of the same shape in the registry
+  (3.3.19 and 3.4.2, never 3.4-alpine)
+- any tag, including `latest`: whether the registry now serves a different
+  image for that tag than the one on this host (needs docker access)
+- services with a build context: the FROM / COPY --from images of their
+  Dockerfile, and whether a base image was published after the local build
+- critical CVEs with a fix available, via trivy, for every service image
+  including locally built ones (those need docker access)
+
+This command only reads; it never changes a file, image or container.  Use
+image-apply for that.  The output is short on purpose: it is meant to be read
+by a small local model.
 """
+import datetime
 import json
 import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 TIMEOUT = 20
 MAX_PAGES = 30
+BUDGET = int(os.environ.get("IMAGE_UPDATES_BUDGET", 780))   # seconds for the whole run
+SCAN_TIMEOUT = int(os.environ.get("IMAGE_UPDATES_SCAN_TIMEOUT", 600))
+ARCH = {"aarch64": "arm64", "x86_64": "amd64"}.get(platform.machine(), platform.machine())
+MANIFEST_TYPES = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+START = time.time()
 
 
-def find_images(compose_path):
-    """Return {image_ref: where_it_is_used} from the compose file and its Dockerfiles."""
+# --- compose file ----------------------------------------------------------
+
+def load_services(compose_path):
+    """Return (project_name, [{name, image, context, dockerfile}])."""
+    import yaml
+    with open(compose_path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
     base = os.path.dirname(os.path.abspath(compose_path))
-    found = {}
-    contexts = []
-    with open(compose_path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.split(" #")[0].rstrip()
-            m = re.match(r"\s*image:\s*[\"']?([^\"'\s]+)", line)
-            if m:
-                found.setdefault(m.group(1), "compose")
-            m = re.match(r"\s*(?:build|context):\s*[\"']?([^\"'\s{]+)", line)
-            if m:
-                contexts.append(m.group(1))
-    for ctx in contexts:
-        dockerfile = os.path.join(base, ctx, "Dockerfile")
-        try:
-            with open(dockerfile, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    m = (re.match(r"\s*FROM\s+(?:--\S+\s+)*(\S+)", line, re.IGNORECASE)
-                         or re.match(r"\s*COPY\s+.*--from=(\S*[:/]\S*)", line, re.IGNORECASE))
-                    if m and "$" not in m.group(1) and m.group(1).lower() != "scratch":
-                        found.setdefault(m.group(1), os.path.join(ctx, "Dockerfile"))
-        except OSError:
-            pass
-    return found
+    project = str(data.get("name") or os.path.basename(base)).lower()
+    services = []
+    for name, svc in (data.get("services") or {}).items():
+        svc = svc or {}
+        build = svc.get("build")
+        context = dockerfile = None
+        if isinstance(build, str):
+            context = build
+        elif isinstance(build, dict):
+            context = build.get("context", ".")
+            dockerfile = build.get("dockerfile")
+        if context is not None:
+            context = os.path.normpath(os.path.join(base, context))
+            dockerfile = os.path.join(context, dockerfile or "Dockerfile")
+        services.append({"name": name, "image": svc.get("image"),
+                         "context": context, "dockerfile": dockerfile})
+    return project, services
 
+
+def dockerfile_bases(path):
+    """Images a Dockerfile pulls: FROM and COPY --from, minus build stage names."""
+    stages, refs = set(), []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r"\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?", line, re.IGNORECASE)
+            if m:
+                refs.append(m.group(1))
+                if m.group(2):
+                    stages.add(m.group(2).lower())
+                continue
+            m = re.match(r"\s*COPY\s+.*--from=(\S+)", line, re.IGNORECASE)
+            if m:
+                refs.append(m.group(1))
+    return sorted({r for r in refs
+                   if r.lower() not in stages and r.lower() != "scratch"
+                   and "$" not in r and not r.isdigit()})
+
+
+# --- registry ---------------------------------------------------------------
 
 def parse_ref(ref):
     """'haproxy:3.3.17' -> ('registry-1.docker.io', 'library/haproxy', '3.3.17')."""
@@ -62,36 +105,39 @@ def parse_ref(ref):
         registry = "registry-1.docker.io"
         if "/" not in repo:
             repo = "library/" + repo
-    return registry, repo, tag
+    return registry, repo, tag or "latest"
 
 
-def _get(url, token=None):
-    headers = {"Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=TIMEOUT)
+_tokens = {}
+
+
+def _open(url, key, accept="application/json"):
+    """GET with the anonymous registry token flow; returns the response."""
+    def get(token):
+        headers = {"Accept": accept}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=TIMEOUT)
+    try:
+        return get(_tokens.get(key))
+    except urllib.error.HTTPError as exc:
+        challenge = exc.headers.get("WWW-Authenticate", "")
+        if exc.code != 401 or key in _tokens or not challenge.lower().startswith("bearer"):
+            raise
+        params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+        query = "&".join(f"{k}={urllib.request.quote(v, safe='')}"
+                         for k, v in params.items() if k in ("service", "scope"))
+        with urllib.request.urlopen(f"{params['realm']}?{query}", timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        _tokens[key] = data.get("token") or data.get("access_token")
+        return get(_tokens[key])
 
 
 def list_tags(registry, repo):
-    """All tags of a repository, using the anonymous registry token flow."""
     url = f"https://{registry}/v2/{repo}/tags/list?n=1000"
-    token = None
     tags = []
     for _page in range(MAX_PAGES):
-        try:
-            resp = _get(url, token)
-        except urllib.error.HTTPError as exc:
-            challenge = exc.headers.get("WWW-Authenticate", "")
-            if exc.code != 401 or token or not challenge.lower().startswith("bearer"):
-                raise
-            params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
-            query = "&".join(f"{k}={urllib.request.quote(v, safe='')}"
-                             for k, v in params.items() if k in ("service", "scope"))
-            with _get(f"{params['realm']}?{query}") as tresp:
-                tdata = json.loads(tresp.read().decode())
-            token = tdata.get("token") or tdata.get("access_token")
-            resp = _get(url, token)
-        with resp:
+        with _open(url, (registry, repo)) as resp:
             tags += json.loads(resp.read().decode()).get("tags") or []
             link = resp.headers.get("Link", "")
         m = re.search(r'<([^>]+)>;\s*rel="next"', link)
@@ -100,6 +146,44 @@ def list_tags(registry, repo):
         url = m.group(1) if m.group(1).startswith("http") else f"https://{registry}{m.group(1)}"
     return tags
 
+
+def _manifest(registry, repo, reference):
+    with _open(f"https://{registry}/v2/{repo}/manifests/{reference}", (registry, repo),
+               MANIFEST_TYPES) as resp:
+        return resp.headers.get("Docker-Content-Digest", ""), json.loads(resp.read().decode())
+
+
+def remote_image(registry, repo, tag):
+    """Return (digests the tag resolves to, creation time of this platform's image)."""
+    digest, manifest = _manifest(registry, repo, tag)
+    digests = {digest} if digest else set()
+    if "manifests" in manifest:   # multi-arch index: pick this machine's image
+        entries = manifest["manifests"]
+        digests |= {e.get("digest") for e in entries}
+        mine = [e for e in entries
+                if e.get("platform", {}).get("architecture") == ARCH
+                and e.get("platform", {}).get("os") == "linux"]
+        if not mine:
+            return digests, None
+        _, manifest = _manifest(registry, repo, mine[0]["digest"])
+    created = None
+    config = manifest.get("config", {}).get("digest")
+    if config:
+        with _open(f"https://{registry}/v2/{repo}/blobs/{config}", (registry, repo)) as resp:
+            created = parse_time(json.loads(resp.read().decode()).get("created"))
+    return digests, created
+
+
+def parse_time(text):
+    if not text:
+        return None
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", text)
+    if not m:
+        return None
+    return datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc)
+
+
+# --- version comparison -----------------------------------------------------
 
 def shape(tag):
     """Split a tag into its fixed text and its numbers: 'v1.2-alpine' -> (('v','.','-alpine'), (1,2))."""
@@ -126,44 +210,179 @@ def newer_tags(tag, tags):
     return newer[-1][1], (in_line[-1][1] if in_line else None)
 
 
-def main():
-    compose = sys.argv[1] if len(sys.argv) > 1 else "/root/compose/docker-compose.yml"
+# --- docker and trivy -------------------------------------------------------
+
+def docker(*args):
+    """Run a docker command; returns stdout, or None on any failure."""
+    if not shutil.which("docker"):
+        return None
     try:
-        images = find_images(compose)
-    except OSError as exc:
-        sys.exit(f"Cannot read {compose}: {exc}")
-    current = 0
-    updates, skipped = [], []
-    for ref, where in sorted(images.items()):
-        registry, repo, tag = parse_ref(ref)
-        src = "" if where == "compose" else f" (FROM in {where})"
-        if not tag or not re.search(r"\d", tag):
-            skipped.append(f"{ref}{src}: tag '{tag or 'latest'}' always follows the newest image")
-            continue
-        try:
+        proc = subprocess.run(("docker",) + args, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def local_image(ref):
+    """Return (repo digests, creation time) of an image on this host, or None."""
+    out = docker("image", "inspect", "--format", "{{json .RepoDigests}}|{{.Created}}", ref)
+    if out is None:
+        return None
+    digests, _, created = out.partition("|")
+    try:
+        digests = {d.split("@")[-1] for d in json.loads(digests) or []}
+    except ValueError:
+        digests = set()
+    return digests, parse_time(created)
+
+
+def trivy_criticals(ref):
+    """Number of fixable critical CVEs in an image; raises RuntimeError on failure."""
+    left = BUDGET - (time.time() - START)
+    if left < 30:
+        raise RuntimeError("not scanned, time limit reached; run again to continue")
+    cmd = ["trivy", "image", "--quiet", "--scanners", "vuln", "--severity", "CRITICAL",
+           "--ignore-unfixed", "--format", "json", "--timeout", f"{SCAN_TIMEOUT}s", ref]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=min(SCAN_TIMEOUT + 30, left))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("scan timed out; run again to continue") from None
+    if proc.returncode != 0:
+        reason = (proc.stderr.strip().splitlines() or ["unknown error"])[-1]
+        raise RuntimeError(f"scan failed: {reason[-160:]}")
+    found = set()
+    for result in json.loads(proc.stdout or "{}").get("Results") or []:
+        for vuln in result.get("Vulnerabilities") or []:
+            found.add((vuln.get("VulnerabilityID"), vuln.get("PkgName")))
+    return len(found)
+
+
+# --- report -----------------------------------------------------------------
+
+def check_registry_image(ref, have_docker, built_at=None, is_base=False):
+    """Return (list of update messages, note or None) for one registry image.
+
+    is_base:  the image is a Dockerfile base; compare its publish time with
+              built_at (when the local image was built) instead of digests."""
+    registry, repo, tag = parse_ref(ref)
+    updates = []
+    note = None
+    try:
+        if re.search(r"\d", tag):
             newest, in_line = newer_tags(tag, list_tags(registry, repo))
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403, 404):
-                skipped.append(f"{ref}{src}: not in a public registry (locally built image, nothing to do)")
-            else:
-                skipped.append(f"{ref}{src}: registry answered HTTP {exc.code}")
+            # 3.3.17 -> 3.3.19 is a patch; 11.4 -> 11.8 stays on the same major.
+            kind = "patch release" if len(shape(tag)[1]) > 2 else "same major version"
+            if in_line and in_line != newest:
+                updates.append(f"newer version {in_line} ({kind}), newest {newest}")
+            elif newest:
+                updates.append(f"newer version {newest}" + (f" ({kind})" if in_line else ""))
+        if is_base:
+            if built_at is not None:
+                _, created = remote_image(registry, repo, tag)
+                if created and created > built_at:
+                    updates.append(f"tag '{tag}' was republished on {created:%Y-%m-%d}, "
+                                   "after the local build; rebuild to pick it up")
+        elif have_docker:
+            local = local_image(ref)
+            if local is None:
+                note = "not pulled on this host"
+            elif local[0] and not (local[0] & remote_image(registry, repo, tag)[0]):
+                updates.append(f"the registry has a newer image for tag '{tag}'; pull to update")
+        elif not re.search(r"\d", tag):
+            note = f"tag '{tag}' can only be checked with docker access"
+    except urllib.error.HTTPError as exc:
+        note = ("not in a public registry" if exc.code in (401, 403, 404)
+                else f"registry answered HTTP {exc.code}")
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+        note = f"registry lookup failed ({exc})"
+    return updates, note
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    compose = args[0] if args else "/root/compose/docker-compose.yml"
+    try:
+        project, services = load_services(compose)
+    except Exception as exc:
+        sys.exit(f"Cannot read {compose}: {exc}")
+    have_docker = docker("version", "--format", "{{.Server.Version}}") is not None
+    scan = "--no-cves" not in sys.argv and shutil.which("trivy") is not None
+    if scan and os.path.isdir("/root/agent"):
+        os.environ.setdefault("TRIVY_CACHE_DIR", "/root/agent/trivy")
+
+    updates, notes, cves, clean = [], [], [], 0
+    checked = current = 0
+    pulled = {}    # registry image -> services using it
+    built = []     # locally built images to scan
+    for svc in services:
+        if svc["context"] is None:
+            if svc["image"]:
+                pulled.setdefault(svc["image"], []).append(svc["name"])
             continue
-        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-            skipped.append(f"{ref}{src}: registry lookup failed ({exc})")
-            continue
-        if not newest:
-            current += 1
-        elif in_line and in_line != newest:
-            updates.append(f"{ref}{src}: same series {in_line}, newest {newest}")
-        elif in_line:
-            updates.append(f"{ref}{src}: same series {newest}")
+        # Locally built service: check the images its Dockerfile is based on.
+        image = svc["image"] or f"{project}-{svc['name']}"
+        label = f"{image} (service {svc['name']}, built from {svc['dockerfile']})"
+        local = local_image(image) if have_docker else None
+        try:
+            bases = dockerfile_bases(svc["dockerfile"])
+        except OSError as exc:
+            notes.append(f"{label}: cannot read the Dockerfile ({exc})")
+            bases = []
+        outdated = False
+        for base in bases:
+            found, note = check_registry_image(base, have_docker, is_base=True,
+                                               built_at=local[1] if local else None)
+            if note:
+                notes.append(f"{base} (base of {image}): {note}")
+            for msg in found:
+                outdated = True
+                updates.append(f"{label}: base image {base}: {msg}")
+        checked += 1
+        current += not outdated
+        if not have_docker:
+            notes.append(f"{label}: needs docker access to check base image age and CVEs")
+        elif local is None:
+            notes.append(f"{label}: not built on this host yet")
         else:
-            updates.append(f"{ref}{src}: newest {newest}")
+            built.append(image)
+
+    to_scan = list(built)
+    for ref in sorted(pulled):
+        found, note = check_registry_image(ref, have_docker)
+        checked += 1
+        current += not found
+        who = f"{ref} (service {', '.join(pulled[ref])})"
+        updates += [f"{who}: {msg}" for msg in found]
+        if note:
+            notes.append(f"{who}: {note}")
+        if note != "not in a public registry":
+            to_scan.append(ref)
+
+    if scan:
+        for ref in to_scan:
+            try:
+                count = trivy_criticals(ref)
+                if count:
+                    cves.append(f"{ref}: {count}")
+                else:
+                    clean += 1
+            except RuntimeError as exc:
+                notes.append(f"{ref}: CVE {exc}")
+
     print(f"UPDATES AVAILABLE ({len(updates)}):" if updates else "No updates available.")
-    print("\n".join(updates))
-    print(f"Up to date: {current} image(s).")
-    if skipped:
-        print(f"NOT CHECKED ({len(skipped)}):\n" + "\n".join(skipped))
+    if updates:
+        print("\n".join(updates))
+    print(f"Up to date: {current} of {checked} image(s).")
+    if scan:
+        if cves:
+            print(f"CRITICAL CVES WITH A FIX ({len(cves)} image(s)):\n" + "\n".join(cves))
+        print(f"No critical CVEs: {clean} image(s).")
+    else:
+        print("CVE scan skipped." if "--no-cves" in sys.argv else "CVE scan skipped: trivy is not installed.")
+    if notes:
+        print(f"NOT CHECKED ({len(notes)}):\n" + "\n".join(notes))
+    if not have_docker:
+        print("No docker access: moving tags such as 'latest' and locally built images were not checked.")
 
 
 if __name__ == "__main__":

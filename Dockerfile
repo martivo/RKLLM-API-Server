@@ -33,6 +33,7 @@ RUN wget -q -O /usr/lib/librkllmrt.so \
 # - flask + flask-cors + gunicorn: core server
 # - numpy + Pillow: required for VL (vision-language) image processing
 # - neonize: WhatsApp client for the optional built-in agent (wa_agent.py); needs libmagic1
+# - pyyaml: compose file parsing in tools/image-updates
 # - prometheus-flask-exporter + prometheus-client: optional metrics (graceful degradation if absent, but include for full feature set)
 RUN pip install --no-cache-dir \
     flask \
@@ -42,18 +43,21 @@ RUN pip install --no-cache-dir \
     Pillow \
     prometheus-flask-exporter \
     prometheus-client \
-    neonize==0.10.0
+    neonize==0.10.0 \
+    pyyaml
 
 # Docker CLI + compose plugin for the agent's shell tool (client only; mount
 # /var/run/docker.sock to use it)
 COPY --from=docker:29.9.3-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker:29.9.3-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+# Trivy for the CVE counts in tools/image-updates
+COPY --from=aquasec/trivy:0.76.2 /usr/local/bin/trivy /usr/local/bin/trivy
 
 WORKDIR /app
 
 COPY api.py gunicorn.config.py healthcheck.py wa_agent.py entrypoint.sh ./
 # Helper commands for the agent's shell tool
-COPY --chmod=755 tools/image-updates /usr/local/bin/image-updates
+COPY --chmod=755 tools/image-updates tools/image-apply /usr/local/bin/
 
 # Models are mounted at runtime — do not bake into image
 VOLUME /root/models

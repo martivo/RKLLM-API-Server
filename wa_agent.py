@@ -49,7 +49,7 @@ ALLOW_FROM = {n.strip().lstrip("+") for n in os.environ.get("AGENT_ALLOW_FROM", 
 PREFIX = os.environ.get("AGENT_PREFIX", "").strip()
 NOTIFY_TO = os.environ.get("AGENT_NOTIFY_TO", "").strip().lstrip("+")
 MAX_STEPS = _env_int("AGENT_MAX_STEPS", 8)
-TOOL_TIMEOUT = _env_int("AGENT_TOOL_TIMEOUT", 120)
+TOOL_TIMEOUT = _env_int("AGENT_TOOL_TIMEOUT", 900)
 TOOL_OUTPUT_CHARS = _env_int("AGENT_TOOL_OUTPUT_CHARS", 3000)
 HISTORY_CHARS = _env_int("AGENT_HISTORY_CHARS", 24000)
 NOTES_CHARS = _env_int("AGENT_NOTES_CHARS", 2000)
@@ -60,6 +60,7 @@ BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "You are a Linux ops assistant answering over WhatsApp. "
     "Use the shell tool to inspect the system, one command at a time. "
     "Never guess what a command would print; run it. "
+    "Never change files, images or containers unless the user asked for that exact change. "
     "When you have the answer, reply in short plain text."
 )
 
@@ -369,8 +370,10 @@ class Core:
         """Handle slash commands without the model; None if not a command."""
         cmd, _, rest = text.strip().partition(" ")
         cmd, rest = cmd.lower(), rest.strip()
-        if cmd not in ("/new", "/status", "/note", "/notes", "/task", "/help"):
-            return None  # includes messages that merely start with a path
+        if not re.match(r"^/[a-z]+$", cmd):
+            return None  # not a command; "/root/compose is ..." goes to the model
+        if cmd == "/tasks":
+            cmd = "/task"
         if cmd == "/new":
             self.chat.reset()
             return "Started a new conversation."
@@ -387,11 +390,13 @@ class Core:
             return _read(NOTES_FILE).strip() or "No notes yet."
         if cmd == "/task":
             return self._task_command(rest, notify)
-        return HELP
+        if cmd == "/help":
+            return HELP
+        return f"Unknown command {cmd}.\n{HELP}"
 
     def _task_command(self, rest, notify):
         sub, _, arg = rest.partition(" ")
-        sub, arg = sub.lower(), arg.strip()
+        sub, arg = sub.lower() or "list", arg.strip()
         if sub == "list":
             state = _load_state()
             lines = []
@@ -429,7 +434,7 @@ class Core:
                 if os.path.exists(_task_path(arg, ext)):
                     os.remove(_task_path(arg, ext))
             return f"Task {arg} removed."
-        return HELP
+        return f"Unknown /task command '{sub}'.\n{HELP}"
 
     def dispatch(self, text, notify=lambda _msg: None):
         """Answer one inbound message (command or chat)."""
