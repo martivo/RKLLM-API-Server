@@ -217,6 +217,22 @@ def newer_tags(tag, tags):
     return newer[-1][1], (in_line[-1][1] if in_line else None)
 
 
+_UBUNTU_LTS = re.compile(r"^(\d\d)\.04$")
+
+
+def maintained_tags(repo, tag, tags):
+    """Drop tags that are not worth moving to.
+
+    Ubuntu: from an LTS release (24.04) only later LTS releases count; the
+    interim ones (24.10, 25.04, 25.10) are supported for nine months only."""
+    def lts(t):
+        m = _UBUNTU_LTS.match(t)
+        return bool(m) and int(m.group(1)) % 2 == 0
+    if repo == "library/ubuntu" and lts(tag):
+        return [t for t in tags if lts(t)]
+    return tags
+
+
 # --- docker and trivy -------------------------------------------------------
 
 def docker(*args):
@@ -277,7 +293,7 @@ def check_registry_image(ref, have_docker, built_at=None, is_base=False):
     note = None
     try:
         if re.search(r"\d", tag):
-            newest, in_line = newer_tags(tag, list_tags(registry, repo))
+            newest, in_line = newer_tags(tag, maintained_tags(repo, tag, list_tags(registry, repo)))
             # 3.3.17 -> 3.3.19 is a patch; 11.4 -> 11.8 stays on the same major.
             kind = "patch release" if len(shape(tag)[1]) > 2 else "same major version"
             if in_line and in_line != newest:

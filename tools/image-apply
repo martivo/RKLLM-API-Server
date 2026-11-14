@@ -7,6 +7,8 @@
     image-apply python:3.12-slim 3.13-slim   change a Dockerfile base, rebuild
     image-apply grafana/grafana          same tag: pull the newest image, recreate
     image-apply grafana                  the same, by service name
+    image-apply phonesync ubuntu:24.10   new base image for one service's Dockerfile
+    image-apply phonesync                rebuild on the same base image tag
 
 With a new tag, every `image:` line in the compose file and every FROM /
 COPY --from in its build contexts that uses the image is rewritten.  Each file
@@ -95,7 +97,7 @@ def main():
     target_arg = args[0]
     new_tag = compose_file = None
     for extra in args[1:]:
-        if extra.endswith((".yml", ".yaml")) or "/" in extra:
+        if extra.endswith((".yml", ".yaml")) or os.path.isfile(extra):
             compose_file = extra
         else:
             new_tag = extra.lstrip(":")
@@ -107,8 +109,27 @@ def main():
 
     # What does the argument name: a service, or an image used somewhere?
     by_name = [s for s in services if s["name"] == target_arg]
+    only_service = False   # True: edit just this service's Dockerfile
+    new_image = None       # "ubuntu:24.10" given as the new tag
+    if new_tag and ":" in new_tag:
+        new_image, new_tag = new_tag, new_tag.rsplit(":", 1)[1]
     if by_name and new_tag and by_name[0]["context"] is None and by_name[0]["image"]:
         target_arg = by_name[0]["image"]   # "haproxy 3.4.7" by service name
+        by_name = []
+    elif by_name and new_tag:
+        # "phonesync ubuntu:24.10" or "phonesync 24.10": a new base image tag
+        # for this one service's Dockerfile, not for every user of that base.
+        try:
+            bases = iu.dockerfile_bases(by_name[0]["dockerfile"])
+        except OSError as exc:
+            sys.exit(f"Cannot read the Dockerfile of {target_arg}: {exc}")
+        if new_image:
+            bases = [b for b in bases if norm(b)[:2] == norm(new_image)[:2]]
+        if len({norm(b) for b in bases}) != 1:
+            found = ", ".join(iu.dockerfile_bases(by_name[0]["dockerfile"])) or "none"
+            sys.exit(f"Which base image of {target_arg}? Its Dockerfile uses: {found}. "
+                     f"Run: image-apply {target_arg} <image>:<new-tag>. Nothing was changed.")
+        target_arg, affected_only, only_service = bases[0], by_name, True
         by_name = []
     if by_name and not new_tag:
         affected = by_name
@@ -127,6 +148,8 @@ def main():
                     refs = []
             if any(norm(r) == target for r in refs):
                 affected.append(svc)
+        if only_service:
+            affected = affected_only
     if not affected:
         used = sorted({s["image"] for s in services if s["image"] and s["context"] is None})
         sys.exit(f"Nothing in {compose_file} uses '{target_arg}'. Images in use: {', '.join(used)}")
@@ -175,8 +198,8 @@ def main():
             new_tag = found
         if new_tag == old_tag:
             sys.exit(f"{target_arg} already uses tag {new_tag}; nothing was changed.")
-        changed = rewrite(compose_file, target, new_tag,
-                          r"\s*image:\s*[\"']?(?P<ref>[^\"'\s#]+)", dry_run)
+        changed = [] if only_service else rewrite(
+            compose_file, target, new_tag, r"\s*image:\s*[\"']?(?P<ref>[^\"'\s#]+)", dry_run)
         for dockerfile in sorted({s["dockerfile"] for s in affected if s["context"] is not None}):
             changed += rewrite(dockerfile, target, new_tag,
                                r"\s*(?:FROM\s+(?:--\S+\s+)*|COPY\s+.*--from=)(?P<ref>\S+)", dry_run)
@@ -197,8 +220,19 @@ def main():
     names = ", ".join(s["name"] for s in affected)
     if dry_run:
         print(f"Dry run only; nothing was changed. Services: {names}")
+    elif ok and new_tag:
+        print(f"DONE: {names} now uses {with_tag(target_arg, new_tag)}.")
     elif ok:
-        print(f"DONE: updated and recreated {names}.")
+        # No tag was given, so no file was edited: say exactly what happened.
+        for svc in affected:
+            if svc["context"] is None:
+                print(f"DONE: pulled {svc['image']} again and recreated {svc['name']} if the image "
+                      "had changed. The tag is unchanged.")
+            else:
+                bases = ", ".join(iu.dockerfile_bases(svc["dockerfile"]))
+                print(f"DONE: rebuilt {svc['name']} from the same base image ({bases}); the "
+                      f"Dockerfile was NOT changed. To change the base image run: "
+                      f"image-apply {svc['name']} <image>:<new-tag>")
     else:
         print(f"FAILED while updating {names}. "
               + ("Restore the files from the backups listed above and run this again."
