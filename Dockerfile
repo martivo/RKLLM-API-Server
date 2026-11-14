@@ -4,6 +4,10 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
+    libgomp1 \
+    git \
+    file \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Download RKLLM runtime library and RKNN runtime library
@@ -11,7 +15,12 @@ RUN wget -q -O /usr/lib/librkllmrt.so \
     https://raw.githubusercontent.com/airockchip/rknn-llm/main/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so \
  && wget -q -O /usr/lib/librknnrt.so \
     https://raw.githubusercontent.com/airockchip/rknn_model_zoo/main/3rdparty/rknpu2/Linux/aarch64/librknnrt.so \
- && ldconfig
+ && git clone --depth 1 --branch release-v1.2.3 https://github.com/airockchip/rknn-llm.git /tmp/rknn-llm \
+    && cp /tmp/rknn-llm/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so /usr/lib/librkllmrt.so \
+    && rm -rf /tmp/rknn-llm \
+    && ldconfig
+
+
 
 # Install Python dependencies
 # - flask + flask-cors + gunicorn: core server
