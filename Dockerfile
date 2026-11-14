@@ -17,15 +17,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Download RKLLM runtime library and RKNN runtime library
+# RKLLM runtime version (a release tag of airockchip/rknn-llm without the
+# "release-" prefix). api.py's ctypes structs match the 1.2.x header; try
+# another version with: docker build --build-arg RKLLM_VERSION=v1.3.0 .
+ARG RKLLM_VERSION=v1.2.3
+
+# Download the RKLLM runtime library (pinned) and the RKNN runtime library
 RUN wget -q -O /usr/lib/librkllmrt.so \
-    https://raw.githubusercontent.com/airockchip/rknn-llm/main/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so \
+    https://raw.githubusercontent.com/airockchip/rknn-llm/release-${RKLLM_VERSION}/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so \
  && wget -q -O /usr/lib/librknnrt.so \
     https://raw.githubusercontent.com/airockchip/rknn_model_zoo/main/3rdparty/rknpu2/Linux/aarch64/librknnrt.so \
- && git clone --depth 1 --branch release-v1.2.3 https://github.com/airockchip/rknn-llm.git /tmp/rknn-llm \
-    && cp /tmp/rknn-llm/rkllm-runtime/Linux/librkllm_api/aarch64/librkllmrt.so /usr/lib/librkllmrt.so \
-    && rm -rf /tmp/rknn-llm \
-    && ldconfig
+ && ldconfig
 
 
 
