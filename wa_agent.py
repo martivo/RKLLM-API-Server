@@ -214,9 +214,8 @@ def build_system_prompt():
 
 _BAD_CALL_RE = re.compile(r"<tool_call|</tool_call>|<function[\s=>-]", re.IGNORECASE)
 BAD_CALL_HINT = (
-    "That tool call was malformed and nothing ran. The only tool is shell. "
-    "Write it exactly like this, with your command inside:\n"
-    '<tool_call>\n{"name": "shell", "arguments": {"command": "image-updates"}}\n</tool_call>'
+    "That tool call was malformed and nothing ran. The only tool is shell and its only "
+    "parameter is command. Call it again in exactly the tool call format from your instructions."
 )
 
 

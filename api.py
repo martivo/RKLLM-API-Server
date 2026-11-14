@@ -384,6 +384,59 @@ _TOOL_SYSTEM_TEMPLATE = (
     "</tool_call>"
 )
 
+# Qwen3.5 was trained on a different call syntax (the one in its own chat
+# template): <function=name><parameter=arg>value</parameter></function>.  Asked
+# for the JSON form above it produces half of each and the call is lost.
+_TOOL_SYSTEM_TEMPLATE_XML = (
+    "# Tools\n\n"
+    "You have access to the following functions:\n\n"
+    "<tools>\n"
+    "{tools_json}\n"
+    "</tools>\n\n"
+    "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n"
+    "<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\n"
+    "value_1\n"
+    "</parameter>\n"
+    "<parameter=example_parameter_2>\n"
+    "This is the value for the second parameter\n"
+    "that can span\n"
+    "multiple lines\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>\n\n"
+    "<IMPORTANT>\n"
+    "Reminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> "
+    "block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language "
+    "BEFORE the function call, but NOT after\n"
+    "- If there is no function call available, answer the question like normal with your "
+    "current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>"
+)
+
+
+def _uses_xml_tool_calls(model_name):
+    """True for models whose native tool-call syntax is <function=...> (Qwen3.5)."""
+    return 'qwen3.5' in (model_name or '').lower()
+
+
+def _render_tool_call(name, args, xml):
+    """One assistant tool call, written the way the model itself writes it."""
+    if not xml:
+        return f'<tool_call>\n{json.dumps({"name": name, "arguments": args}, ensure_ascii=False)}\n</tool_call>'
+    parts = [f'<tool_call>\n<function={name}>\n']
+    for key, value in (args.items() if isinstance(args, dict) else ()):
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        parts.append(f'<parameter={key}>\n{value}\n</parameter>\n')
+    parts.append('</function>\n</tool_call>')
+    return ''.join(parts)
+
+
 # RAG quality controls
 RAG_MIN_QUALITY_SCORE = 2
 RAG_MAX_PARAGRAPHS = 10
@@ -473,6 +526,10 @@ def _jaccard_similarity(text_a, text_b):
 
 
 _RE_TOOL_CALL = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL)
+_RE_XML_FUNCTION = re.compile(
+    r'<function=([^>\s]+)>(.*?)(?:</function>|</tool_call>|(?=<function=)|\Z)', re.DOTALL)
+_RE_XML_PARAMETER = re.compile(
+    r'<parameter=([^>\s]+)>\n?(.*?)(?:</parameter>|(?=<parameter=)|\Z)', re.DOTALL)
 
 
 def _parse_tool_calls(text):
@@ -481,6 +538,25 @@ def _parse_tool_calls(text):
     Returns a list of OpenAI-format tool_call dicts, or None if none found.
     """
     calls = []
+    # Qwen3.5 form: <function=name><parameter=arg>value</parameter></function>.
+    # The closing tags are optional here: generation may stop right after the call.
+    for m in _RE_XML_FUNCTION.finditer(text):
+        args = {}
+        for pm in _RE_XML_PARAMETER.finditer(m.group(2)):
+            value = pm.group(2).strip('\n')
+            try:
+                parsed = json.loads(value)
+                # Only objects, lists, numbers and booleans are meant as JSON.
+                args[pm.group(1)] = value if isinstance(parsed, str) or parsed is None else parsed
+            except ValueError:
+                args[pm.group(1)] = value
+        calls.append({
+            'id': f"call_{uuid.uuid4().hex[:8]}",
+            'type': 'function',
+            'function': {'name': m.group(1), 'arguments': json.dumps(args, ensure_ascii=False)},
+        })
+    if calls:
+        return calls
     for m in _RE_TOOL_CALL.finditer(text):
         try:
             data = json.loads(m.group(1))
@@ -2614,9 +2690,7 @@ def build_prompt(messages, model_name):
                     args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                tc_parts.append(
-                    f'<tool_call>\n{json.dumps({"name": name, "arguments": args}, ensure_ascii=False)}\n</tool_call>'
-                )
+                tc_parts.append(_render_tool_call(name, args, _uses_xml_tool_calls(model_name)))
             combined = '\n'.join(tc_parts)
             if content:
                 combined = f"{content}\n{combined}"
@@ -3796,9 +3870,14 @@ def chat_completions():
     if _has_tools:
         _tools_defs = [t.get('function', t) for t in _req_tools if isinstance(t, dict)]
         _tools_json = json.dumps(_tools_defs, ensure_ascii=False, separators=(',',':'))
-        _tool_sys_content = _TOOL_SYSTEM_TEMPLATE.format(tools_json=_tools_json)
+        _xml_tools = _uses_xml_tool_calls(resolve_model(requested_model)[0] or requested_model)
+        if _xml_tools:   # one definition per line, as in the model's own template
+            _tools_json = "\n".join(json.dumps(t, ensure_ascii=False) for t in _tools_defs)
+        _tool_sys_content = (_TOOL_SYSTEM_TEMPLATE_XML if _xml_tools
+                             else _TOOL_SYSTEM_TEMPLATE).format(tools_json=_tools_json)
         messages = [{'role': 'system', 'content': _tool_sys_content}] + messages
-        logger.info(f"[{request_id}] Tool calling: {len(_tools_defs)} tool(s) injected")
+        logger.info(f"[{request_id}] Tool calling: {len(_tools_defs)} tool(s) injected "
+                    f"({'function/parameter' if _xml_tools else 'JSON'} call format)")
 
     # Log ignored sampling parameters; surface as response header so callers know.
     ignored_params = {k: body[k] for k, default in _SAMPLING_DEFAULTS.items()
