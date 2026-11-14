@@ -63,7 +63,7 @@ BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "If a command fails or is not enough, try another way before answering. "
     "Never guess what a command would print; run it. "
     "Never change files, images or containers unless the user asked for that exact change. "
-    "Installed commands, call them by name: "
+    "Your only tool is shell. These programs are installed; run them through the shell tool: "
     "image-updates [name] reports newer versions and critical CVEs and changes nothing; "
     "image-apply <service-or-image> [new-tag] updates one image when the user asks for it "
     "(backs up the files, pulls, recreates); if it fails, read its message and fix the arguments. "
@@ -212,6 +212,14 @@ def build_system_prompt():
     return prompt
 
 
+_BAD_CALL_RE = re.compile(r"<tool_call|</tool_call>|<function[\s=>-]", re.IGNORECASE)
+BAD_CALL_HINT = (
+    "That tool call was malformed and nothing ran. The only tool is shell. "
+    "Write it exactly like this, with your command inside:\n"
+    '<tool_call>\n{"name": "shell", "arguments": {"command": "image-updates"}}\n</tool_call>'
+)
+
+
 class Agent:
     """One append-only conversation against the chat completions API."""
 
@@ -267,6 +275,12 @@ class Agent:
                 raise Stopped()
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
+            if not calls and _BAD_CALL_RE.search(content):
+                # The model tried to call a tool but the server could not parse it.
+                log.info("malformed tool call, asking again: %s", content[:200])
+                self.history.append({"role": "assistant", "content": content})
+                self.history.append({"role": "user", "content": BAD_CALL_HINT})
+                continue
             if not calls:
                 self.history.append({"role": "assistant", "content": content})
                 self.last_used = time.time()
