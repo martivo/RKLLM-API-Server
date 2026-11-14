@@ -336,7 +336,8 @@ def due_tasks(now=None):
 
 def task_prompt(name):
     _schedule, body = load_task(name)
-    prompt = f"Scheduled task '{name}'. Carry it out now.\n\nInstructions:\n{body}"
+    prompt = (f"Scheduled task '{name}'. Carry it out now. Where the instructions name a "
+              f"command, run exactly that command.\n\nInstructions:\n{body}")
     learned = _read(_task_path(name, ".notes")).strip()
     if learned:
         prompt += f"\n\nWhat you learned on earlier runs:\n{_tail(learned, NOTES_CHARS)}"

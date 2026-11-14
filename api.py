@@ -2057,7 +2057,14 @@ def _check_kv_incremental(model_name, messages):
         if _count_tokens(_all_text, model_name) > int(_ctx * (1 - HISTORY_CONTEXT_RESERVE)):
             return None
 
-        return "\n".join(inputs[-trailing:])
+        text = "\n".join(inputs[-trailing:])
+        # Qwen3.5's chat template raises "no user query" for a user turn that
+        # is exactly a <tool_response> block, and the runtime then fails with
+        # "Chat template auto-parsing failed".  A leading newline keeps the
+        # rendered turn the same apart from one blank line.
+        if text.startswith('<tool_response>'):
+            text = "\n" + text
+        return text
 
 
 def _update_kv_tracking(model_name, messages, is_reset):
@@ -4353,6 +4360,7 @@ def chat_completions():
         #   so Turn 2 would find an empty cache.  We use keep_history=1
         #   with an explicit clear_kv_cache() call instead.
         kv_is_reset = False
+        fallback_prompt = None   # full prompt, used if an incremental turn fails
         if is_rag:
             keep_history = 0
             kv_is_reset = True
@@ -4371,6 +4379,7 @@ def chat_completions():
                             f"vs {len(prompt)} full)")
                 if _PROMETHEUS_AVAILABLE:
                     rkllm_kv_cache_result.labels(result="incremental").inc()
+                fallback_prompt = prompt
                 prompt = incremental_msg
                 keep_history = 1
             else:
@@ -4485,6 +4494,7 @@ def chat_completions():
                     kv_is_reset=kv_is_reset,
                     req_stop=req_stop,
                     has_tools=_has_tools,
+                    fallback_prompt=fallback_prompt,
                 )),
                 mimetype='text/event-stream',
                 headers=_stream_hdrs,
@@ -4500,6 +4510,7 @@ def chat_completions():
                 kv_is_reset=kv_is_reset,
                 req_stop=req_stop,
                 has_tools=_has_tools,
+                fallback_prompt=fallback_prompt,
             )
             for _h, _v in _rl_hdrs.items():
                 _r.headers[_h] = _v
@@ -4523,7 +4534,7 @@ def _generate_stream(prompt, request_id, model_name, created,
                      include_usage=False, messages=None,
                      is_rag=False, rag_cache_info=None,
                      kv_is_reset=False, vl_data=None, req_stop=None,
-                     has_tools=False):
+                     has_tools=False, fallback_prompt=None):
     """Generator that yields SSE chunks from rkllm token callback queue."""
     global _worker_thread
 
@@ -4565,6 +4576,16 @@ def _generate_stream(prompt, request_id, model_name, created,
                                           keep_history=keep_history,
                                           enable_thinking=enable_thinking,
                                           save_prompt_cache_path=_save_cache_path)
+                if ret != 0 and fallback_prompt:
+                    # The runtime rejected the incremental turn (it fails
+                    # before generating anything).  Start over with the full
+                    # prompt instead of returning an empty answer.
+                    logger.warning(f"[{request_id}] Incremental turn failed (code {ret}) "
+                                   f"— retrying with the full prompt")
+                    _active_wrapper.clear_kv_cache()
+                    ret = _active_wrapper.run(fallback_prompt, role="user",
+                                              keep_history=keep_history,
+                                              enable_thinking=enable_thinking)
             if ret != 0:
                 logger.error(f"[{request_id}] rkllm_run returned error code {ret}")
                 _token_queue.put(("error", f"rkllm_run returned {ret}"))
@@ -4907,7 +4928,7 @@ def _generate_complete(prompt, request_id, model_name, created,
                        keep_history=1, enable_thinking=True,
                        is_rag=False, messages=None, rag_cache_info=None,
                        kv_is_reset=False, vl_data=None, req_stop=None,
-                       has_tools=False):
+                       has_tools=False, fallback_prompt=None):
     """Collect all output and return a non-streaming JSON response."""
     global _worker_thread
 
@@ -4945,6 +4966,16 @@ def _generate_complete(prompt, request_id, model_name, created,
                                           keep_history=keep_history,
                                           enable_thinking=enable_thinking,
                                           save_prompt_cache_path=_save_cache_path)
+                if ret != 0 and fallback_prompt:
+                    # The runtime rejected the incremental turn (it fails
+                    # before generating anything).  Start over with the full
+                    # prompt instead of returning an empty answer.
+                    logger.warning(f"[{request_id}] Incremental turn failed (code {ret}) "
+                                   f"— retrying with the full prompt")
+                    _active_wrapper.clear_kv_cache()
+                    ret = _active_wrapper.run(fallback_prompt, role="user",
+                                              keep_history=keep_history,
+                                              enable_thinking=enable_thinking)
             if ret != 0:
                 logger.error(f"[{request_id}] rkllm_run returned error code {ret}")
                 _token_queue.put(("error", f"rkllm_run returned {ret}"))
