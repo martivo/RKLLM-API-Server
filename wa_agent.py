@@ -24,6 +24,7 @@ import logging
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -84,6 +85,7 @@ TOOLS = [{
 }]
 
 HELP = (
+    "/stop - stop what is running and drop queued messages\n"
     "/new - start a new conversation\n"
     "/status - model and history size\n"
     "/note <text> - remember something\n"
@@ -142,18 +144,50 @@ def resolve_model():
         time.sleep(5)
 
 
-def run_shell(command):
+class Stopped(Exception):
+    """The user sent /stop."""
+
+
+STOP = threading.Event()
+_running = {"proc": None}
+
+
+def _kill(proc):
     try:
-        proc = subprocess.run(
-            command, shell=True, cwd=WORKDIR, timeout=TOOL_TIMEOUT,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, errors="replace",
-        )
-        out = proc.stdout.strip()
+        os.killpg(proc.pid, signal.SIGKILL)   # the shell and everything it started
+    except OSError:
+        pass
+
+
+def request_stop():
+    """Stop the current step: the shell command and the model's generation."""
+    STOP.set()
+    proc = _running["proc"]
+    if proc is not None:
+        _kill(proc)
+    try:
+        _http_json(f"{API_URL}/abort", {}, timeout=10)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log.warning("Abort request failed: %s", exc)
+
+
+def run_shell(command):
+    proc = subprocess.Popen(
+        command, shell=True, cwd=WORKDIR, start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace",
+    )
+    _running["proc"] = proc
+    try:
+        out = proc.communicate(timeout=TOOL_TIMEOUT)[0].strip()
         if proc.returncode != 0:
             out = f"{out}\n[exit code {proc.returncode}]".strip()
     except subprocess.TimeoutExpired:
+        _kill(proc)
+        proc.communicate()
         out = f"[command timed out after {TOOL_TIMEOUT}s]"
+    finally:
+        _running["proc"] = None
     if not out:
         out = "[no output]"
     if len(out) > TOOL_OUTPUT_CHARS:
@@ -213,15 +247,25 @@ class Agent:
             notes.append("(context was full, started a new conversation)")
         self.last_used = now
 
+        start = len(self.history)
         self.history.append({"role": "user", "content": text})
+        try:
+            return "\n".join(notes + [self._steps(notify)])
+        except Stopped:
+            del self.history[start:]   # forget the unfinished turn
+            raise
+
+    def _steps(self, notify):
         for _step in range(MAX_STEPS):
             msg = self._complete()
+            if STOP.is_set():
+                raise Stopped()
             calls = msg.get("tool_calls") or []
             content = (msg.get("content") or "").strip()
             if not calls:
                 self.history.append({"role": "assistant", "content": content})
                 self.last_used = time.time()
-                return "\n".join(notes + [content or "(empty answer)"])
+                return content or "(empty answer)"
 
             self.history.append({"role": "assistant", "content": content, "tool_calls": calls})
             for call in calls:
@@ -240,10 +284,12 @@ class Agent:
                     if PROGRESS:
                         notify(f"$ {command}")
                     result = run_shell(command)
+                    if STOP.is_set():
+                        raise Stopped()
                 self.history.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
         self.last_used = time.time()
-        return "\n".join(notes + [f"Stopped after {MAX_STEPS} steps without a final answer. "
-                                  "Send a follow-up to continue or /new to start over."])
+        return (f"Stopped after {MAX_STEPS} steps without a final answer. "
+                "Send a follow-up to continue or /new to start over.")
 
 
 # --- Scheduled tasks -------------------------------------------------------
@@ -376,6 +422,8 @@ class Core:
             return None  # not a command; "/root/compose is ..." goes to the model
         if cmd == "/tasks":
             cmd = "/task"
+        if cmd == "/stop":
+            return "Nothing is running."   # a running job is stopped before it gets here
         if cmd == "/new":
             self.chat.reset()
             return "Started a new conversation."
@@ -440,11 +488,14 @@ class Core:
 
     def dispatch(self, text, notify=lambda _msg: None):
         """Answer one inbound message (command or chat)."""
+        STOP.clear()
         try:
             reply = self.command(text, notify)
             if reply is None:
                 reply = self.chat.handle(text, notify)
             return reply
+        except Stopped:
+            return "Stopped."
         except Exception as exc:
             log.exception("Request failed")
             return f"Error: {exc}"
@@ -469,6 +520,7 @@ def run_whatsapp(core):
     client = NewClient(os.path.join(DATA_DIR, "whatsapp.db"))
     inbox = queue.Queue()
     connected = threading.Event()
+    busy = threading.Event()   # the worker is handling a message or task
     seen_ids = set()
     sent_ids = set()
     sent_texts = set()
@@ -540,25 +592,45 @@ def run_whatsapp(core):
             if not senders & ALLOW_FROM:
                 log.warning("Ignoring message from %s (not in AGENT_ALLOW_FROM)", sorted(senders))
                 return
+        if text.lower() == "/stop" and busy.is_set():
+            # Handled here, not queued: the worker is busy with what we stop.
+            dropped = 0
+            while True:
+                try:
+                    inbox.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            threading.Thread(target=request_stop, daemon=True).start()
+            if dropped:
+                send(src.Chat, f"Stopping; dropped {dropped} queued message(s).")
+            return
         inbox.put(("msg", src.Chat, text))
 
     def worker():
         while True:
             kind, chat, text = inbox.get()
-            if kind == "task":
-                try:
-                    report = core.run_task(text)
-                except Exception as exc:
-                    log.exception("Task %s failed", text)
-                    report = f"failed: {exc}"
-                if report.strip().upper().startswith("NOTHING"):
-                    log.info("Task %s: nothing to report", text)
-                else:
-                    send(home_chat(), f"[{text}] {report}")
-                continue
-            if PROGRESS and not inbox.empty():
-                send(chat, f"({inbox.qsize()} more queued)")
-            send(chat, core.dispatch(text, notify=lambda m: send(chat, m)))
+            busy.set()
+            try:
+                if kind == "task":
+                    STOP.clear()
+                    try:
+                        report = core.run_task(text)
+                    except Stopped:
+                        report = "stopped."
+                    except Exception as exc:
+                        log.exception("Task %s failed", text)
+                        report = f"failed: {exc}"
+                    if report.strip().upper().startswith("NOTHING"):
+                        log.info("Task %s: nothing to report", text)
+                    else:
+                        send(home_chat(), f"[{text}] {report}")
+                    continue
+                if PROGRESS and not inbox.empty():
+                    send(chat, f"({inbox.qsize()} more queued)")
+                send(chat, core.dispatch(text, notify=lambda m: send(chat, m)))
+            finally:
+                busy.clear()
 
     def scheduler():
         connected.wait()

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Report image updates and critical CVEs for a docker compose file.
 
-    image-updates [--no-cves] [compose-file]
+    image-updates [--no-cves] [name] [compose-file]
+
+A name limits the report to services whose name or image contains it, for
+example `image-updates wireguard`.
 
 For every service it checks:
 
@@ -305,11 +308,19 @@ def check_registry_image(ref, have_docker, built_at=None, is_base=False):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    compose = args[0] if args else "/root/compose/docker-compose.yml"
+    files = [a for a in args if a.endswith((".yml", ".yaml")) or os.path.isfile(a)]
+    names = [a.lower() for a in args if a not in files]
+    compose = files[0] if files else "/root/compose/docker-compose.yml"
     try:
         project, services = load_services(compose)
     except Exception as exc:
         sys.exit(f"Cannot read {compose}: {exc}")
+    if names:
+        every = sorted(s["name"] for s in services)
+        services = [s for s in services
+                    if any(n in s["name"].lower() or n in (s["image"] or "").lower() for n in names)]
+        if not services:
+            sys.exit(f"No service or image matches {' '.join(names)}. Services: {', '.join(every)}")
     have_docker = docker("version", "--format", "{{.Server.Version}}") is not None
     scan = "--no-cves" not in sys.argv and shutil.which("trivy") is not None
     if scan and os.path.isdir("/root/agent"):

@@ -62,9 +62,10 @@ the agent full control of every container on the host:
 A 4B model cannot work out how to query a registry or edit YAML safely, so
 those jobs are shipped as commands the model only has to run and summarise.
 
-### `image-updates [--no-cves] [compose-file]`
+### `image-updates [--no-cves] [name] [compose-file]`
 
-Read-only report; it never changes a file, image or container.
+Read-only report; it never changes a file, image or container. A name limits
+it to matching services or images: `image-updates wireguard`.
 
 - **Version tags** (`haproxy:3.3.17`): newer tags of the same shape (`3.3.19`
   and `3.4.2`, never `3.4-alpine`).
@@ -120,6 +121,8 @@ Tell the agent about the helpers once:
 Commands are handled by the agent itself, so they are instant and never touch
 the model.
 
+- `/stop` stops the running job (the shell command and the model's current
+  answer) and drops queued messages; the unfinished turn is forgotten
 - `/new` starts a new conversation
 - `/status` shows the model, history size and tasks
 - `/note <text>` remembers something; `/notes` shows what is remembered
