@@ -27,7 +27,9 @@ MINIMUM SDK: librkllmrt.so ≥ v1.2.0 (RKLLM Runtime from airockchip/rknn-llm)
     n_keep, n_batch, use_cross_attn, and enable_thinking.  Running against an
     older librkllmrt.so will cause silent struct-offset misalignment — the
     parameter block passed to rkllm_init() would be corrupted, producing wrong
-    sampling behaviour rather than a crash.  Currently running v1.3.0 (built 2026-06-16).
+    sampling behaviour rather than a crash.  The structs follow the runtime
+    version in the RKLLM_VERSION environment variable (set by the Dockerfile):
+    the 1.2.x layout by default, the 1.3.x layout for v1.3.0 and newer.
 
 Usage:
     gunicorn -w 1 -k gthread --threads 4 --timeout 300 -b 0.0.0.0:8000 api:app
@@ -962,6 +964,19 @@ class RKLLMExtendParam(ctypes.Structure):
     ]
 
 
+# The C structs changed in runtime 1.3.0 (rkllm.h): RKLLMParam lost img_* and
+# gained ignore_eos_token, the multimodal input became nested, RKLLMInferParam
+# gained sampling_params and max_new_tokens, and rkllm_init takes an
+# RKLLMCallback struct.  The Dockerfile exports the version it downloaded.
+def _parse_rt_version(text):
+    nums = re.findall(r"\d+", text or "")[:3]
+    return tuple(int(n) for n in nums) if nums else (1, 2, 3)
+
+
+RKLLM_RT_VERSION = _parse_rt_version(os.environ.get("RKLLM_VERSION", "v1.2.3"))
+_RT_13 = RKLLM_RT_VERSION >= (1, 3)
+
+
 class RKLLMParam(ctypes.Structure):
     _fields_ = [
         ("model_path", ctypes.c_char_p),
@@ -978,10 +993,15 @@ class RKLLMParam(ctypes.Structure):
         ("mirostat_tau", ctypes.c_float),
         ("mirostat_eta", ctypes.c_float),
         ("skip_special_token", ctypes.c_bool),
+    ] + ([
+        ("ignore_eos_token", ctypes.c_bool),
+        ("is_async", ctypes.c_bool),
+    ] if _RT_13 else [
         ("is_async", ctypes.c_bool),
         ("img_start", ctypes.c_char_p),
         ("img_end", ctypes.c_char_p),
         ("img_content", ctypes.c_char_p),
+    ]) + [
         ("extend_param", RKLLMExtendParam),
     ]
 
@@ -1008,15 +1028,55 @@ class RKLLMTokenInput(ctypes.Structure):
     ]
 
 
-class RKLLMMultiModalInput(ctypes.Structure):
+class RKLLMImageInput(ctypes.Structure):      # runtime >= 1.3.0
     _fields_ = [
-        ("prompt", ctypes.c_char_p),
+        ("image_embed", ctypes.POINTER(ctypes.c_float)),
+        ("n_image_tokens", ctypes.c_size_t),
+        ("n_image", ctypes.c_size_t),
+        ("image_start", ctypes.c_char_p),
+        ("image_end", ctypes.c_char_p),
+        ("image_content", ctypes.c_char_p),
+        ("image_width", ctypes.c_size_t),
+        ("image_height", ctypes.c_size_t),
+    ]
+
+
+class RKLLMVideoInput(ctypes.Structure):      # runtime >= 1.3.0
+    _fields_ = [
+        ("video_embed", ctypes.POINTER(ctypes.c_float)),
+        ("n_frame_tokens", ctypes.c_size_t),
+        ("n_frame_per_video", ctypes.c_size_t),
+        ("n_video", ctypes.c_size_t),
+        ("video_start", ctypes.c_char_p),
+        ("video_end", ctypes.c_char_p),
+        ("video_content", ctypes.c_char_p),
+        ("frame_width", ctypes.c_size_t),
+        ("frame_height", ctypes.c_size_t),
+    ]
+
+
+class RKLLMAudioInput(ctypes.Structure):      # runtime >= 1.3.1
+    _fields_ = [
+        ("audio_embed", ctypes.POINTER(ctypes.c_float)),
+        ("n_audio_tokens", ctypes.c_size_t),
+        ("n_audio", ctypes.c_size_t),
+        ("audio_start", ctypes.c_char_p),
+        ("audio_end", ctypes.c_char_p),
+        ("audio_content", ctypes.c_char_p),
+    ]
+
+
+class RKLLMMultiModalInput(ctypes.Structure):
+    _fields_ = [("prompt", ctypes.c_char_p)] + ((
+        [("image", RKLLMImageInput), ("video", RKLLMVideoInput)]
+        + ([("audio", RKLLMAudioInput)] if RKLLM_RT_VERSION >= (1, 3, 1) else [])
+    ) if _RT_13 else [
         ("image_embed", ctypes.POINTER(ctypes.c_float)),
         ("n_image_tokens", ctypes.c_size_t),
         ("n_image", ctypes.c_size_t),
         ("image_width", ctypes.c_size_t),
         ("image_height", ctypes.c_size_t),
-    ]
+    ])
 
 
 class RKLLMInputUnion(ctypes.Union):
@@ -1051,12 +1111,19 @@ class RKLLMPromptCacheParam(ctypes.Structure):
 
 
 class RKLLMInferParam(ctypes.Structure):
+    # On >= 1.3.0 sampling_params stays NULL and max_new_tokens 0, which both
+    # mean "use the values given to rkllm_init".
     _fields_ = [
         ("mode", RKLLMInferMode),
         ("lora_params", ctypes.POINTER(RKLLMLoraParam)),
         ("prompt_cache_params", ctypes.POINTER(RKLLMPromptCacheParam)),
+    ] + ([
+        ("sampling_params", ctypes.c_void_p),
         ("keep_history", ctypes.c_int),
-    ]
+        ("max_new_tokens", ctypes.c_int32),
+    ] if _RT_13 else [
+        ("keep_history", ctypes.c_int),
+    ])
 
 
 class RKLLMResultLastHiddenLayer(ctypes.Structure):
@@ -1165,6 +1232,21 @@ def _rkllm_callback_impl(result_ptr, userdata, state):
 
 # Must keep a reference to prevent garbage collection of the callback
 _rkllm_callback = callback_type(_rkllm_callback_impl)
+
+
+class RKLLMCallback(ctypes.Structure):        # runtime >= 1.3.0: rkllm_init argument
+    _fields_ = [
+        ("result_callback", callback_type),
+        ("result_userdata", ctypes.c_void_p),
+        ("tokenizer_callback", ctypes.c_void_p),
+        ("tokenizer_userdata", ctypes.c_void_p),
+        ("embed_callback", ctypes.c_void_p),
+        ("embed_userdata", ctypes.c_void_p),
+    ]
+
+
+# Module-level so it outlives rkllm_init; the runtime may keep the pointer.
+_rkllm_callbacks = RKLLMCallback(result_callback=_rkllm_callback)
 
 
 # =============================================================================
@@ -1536,7 +1618,7 @@ class RKLLMWrapper:
         self.lib.rkllm_init.argtypes = [
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(RKLLMParam),
-            callback_type,
+            ctypes.POINTER(RKLLMCallback) if _RT_13 else callback_type,
         ]
         self.lib.rkllm_init.restype = ctypes.c_int
 
@@ -1624,14 +1706,18 @@ class RKLLMWrapper:
         param.skip_special_token = True
         param.is_async = False
         if vl_config:
-            param.img_start = vl_config.get('img_start', '').encode('utf-8')
-            param.img_end = vl_config.get('img_end', '').encode('utf-8')
-            param.img_content = vl_config.get('img_content', '').encode('utf-8')
+            # Runtime >= 1.3.0 takes the image tags per request instead (run_multimodal).
+            self._img_tags = tuple(vl_config.get(k, '').encode('utf-8')
+                                   for k in ('img_start', 'img_end', 'img_content'))
+            if not _RT_13:
+                param.img_start, param.img_end, param.img_content = self._img_tags
             param.extend_param.base_domain_id = vl_config.get('base_domain_id', 1)
         else:
-            param.img_start = b""
-            param.img_end = b""
-            param.img_content = b""
+            self._img_tags = (b"", b"", b"")
+            if not _RT_13:
+                param.img_start = b""
+                param.img_end = b""
+                param.img_content = b""
             param.extend_param.base_domain_id = 1  # domain 1 for all text models (same as VL); safe because load_model() calls unload_current() before init and REQUEST_STALE_TIMEOUT prevents concurrent loads
         param.extend_param.embed_flash = 1
         param.extend_param.n_batch = 1
@@ -1642,7 +1728,8 @@ class RKLLMWrapper:
 
         self.handle = ctypes.c_void_p()
         ret = self.lib.rkllm_init(
-            ctypes.byref(self.handle), ctypes.byref(param), _rkllm_callback
+            ctypes.byref(self.handle), ctypes.byref(param),
+            ctypes.byref(_rkllm_callbacks) if _RT_13 else _rkllm_callback
         )
         if ret != 0:
             logger.error(f"rkllm_init failed (ret={ret}) for model '{param.model_path.decode()}'")
@@ -1747,11 +1834,16 @@ class RKLLMWrapper:
         rkllm_input.enable_thinking = ctypes.c_bool(False)
         rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL
         rkllm_input.input_data.multimodal_input.prompt = prompt.encode('utf-8')
-        rkllm_input.input_data.multimodal_input.image_embed = embed_ptr
-        rkllm_input.input_data.multimodal_input.n_image_tokens = n_image_tokens
-        rkllm_input.input_data.multimodal_input.n_image = n_image
-        rkllm_input.input_data.multimodal_input.image_width = image_width
-        rkllm_input.input_data.multimodal_input.image_height = image_height
+        _mm = rkllm_input.input_data.multimodal_input
+        if _RT_13:
+            _mm = _mm.image
+            _mm.image_start, _mm.image_end, _mm.image_content = getattr(
+                self, '_img_tags', (b"", b"", b""))
+        _mm.image_embed = embed_ptr
+        _mm.n_image_tokens = n_image_tokens
+        _mm.n_image = n_image
+        _mm.image_width = image_width
+        _mm.image_height = image_height
 
         infer_param = RKLLMInferParam()
         ctypes.memset(ctypes.byref(infer_param), 0, ctypes.sizeof(RKLLMInferParam))

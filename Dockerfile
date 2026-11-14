@@ -21,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # "release-" prefix). api.py's ctypes structs match the 1.2.x header; try
 # another version with: docker build --build-arg RKLLM_VERSION=v1.3.0 .
 ARG RKLLM_VERSION=v1.2.3
+# api.py selects its struct layout from this
+ENV RKLLM_VERSION=${RKLLM_VERSION}
 
 # Download the RKLLM runtime library (pinned) and the RKNN runtime library
 RUN wget -q -O /usr/lib/librkllmrt.so \
