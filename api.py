@@ -402,7 +402,7 @@ REQUEST_STALE_TIMEOUT = 120  # must exceed worst-case model load time (~90s on N
 
 # Monitoring
 MONITOR_INTERVAL = 10
-IDLE_UNLOAD_TIMEOUT = 300
+IDLE_UNLOAD_TIMEOUT = int(os.environ.get("RKLLM_IDLE_UNLOAD", 300))  # seconds; 0 = never unload
 VL_IDLE_UNLOAD_TIMEOUT = 300  # Auto-unload VL model after idle (frees NPU memory for large text models)
 QUEUE_WAIT_TIMEOUT = int(os.environ.get('RKLLM_QUEUE_TIMEOUT', '240'))  # seconds to wait for a busy slot
 
