@@ -138,12 +138,18 @@ def main():
         registry, repo, tag = parse_ref(ref)
         src = "" if where == "compose" else f" (FROM in {where})"
         if not tag or not re.search(r"\d", tag):
-            skipped.append(f"{ref}{src}: tag '{tag or 'latest'}' is not a version, cannot compare")
+            skipped.append(f"{ref}{src}: tag '{tag or 'latest'}' always follows the newest image")
             continue
         try:
             newest, in_line = newer_tags(tag, list_tags(registry, repo))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 404):
+                skipped.append(f"{ref}{src}: not in a public registry (locally built image, nothing to do)")
+            else:
+                skipped.append(f"{ref}{src}: registry answered HTTP {exc.code}")
+            continue
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-            skipped.append(f"{ref}{src}: registry lookup failed ({exc}); local build?")
+            skipped.append(f"{ref}{src}: registry lookup failed ({exc})")
             continue
         if not newest:
             current += 1

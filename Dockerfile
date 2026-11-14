@@ -9,6 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     file \
     curl \
     libmagic1 \
+    iputils-ping \
+    iproute2 \
+    dnsutils \
+    netcat-openbsd \
+    procps \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Download RKLLM runtime library and RKNN runtime library
