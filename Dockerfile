@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     file \
     curl \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Download RKLLM runtime library and RKNN runtime library
@@ -25,6 +26,7 @@ RUN wget -q -O /usr/lib/librkllmrt.so \
 # Install Python dependencies
 # - flask + flask-cors + gunicorn: core server
 # - numpy + Pillow: required for VL (vision-language) image processing
+# - neonize: WhatsApp client for the optional built-in agent (wa_agent.py); needs libmagic1
 # - prometheus-flask-exporter + prometheus-client: optional metrics (graceful degradation if absent, but include for full feature set)
 RUN pip install --no-cache-dir \
     flask \
@@ -33,11 +35,12 @@ RUN pip install --no-cache-dir \
     numpy \
     Pillow \
     prometheus-flask-exporter \
-    prometheus-client
+    prometheus-client \
+    neonize==0.10.0
 
 WORKDIR /app
 
-COPY api.py gunicorn.config.py healthcheck.py ./
+COPY api.py gunicorn.config.py healthcheck.py wa_agent.py entrypoint.sh ./
 
 # Models are mounted at runtime — do not bake into image
 VOLUME /root/models
@@ -50,9 +53,12 @@ ENV RKLLM_LOG_LEVEL=1 \
     GUNICORN_BIND=0.0.0.0:8000 \
     GUNICORN_WORKERS=1 \
     GUNICORN_THREADS=4 \
-    GUNICORN_TIMEOUT=300
+    GUNICORN_TIMEOUT=300 \
+    PYTHONUNBUFFERED=1 \
+    AGENT_ENABLED=0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python /app/healthcheck.py
 
-CMD ["gunicorn", "--config", "gunicorn.config.py", "api:app"]
+# entrypoint.sh starts the optional WhatsApp agent (AGENT_ENABLED=1) next to gunicorn
+CMD ["sh", "/app/entrypoint.sh"]
