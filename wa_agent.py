@@ -63,6 +63,11 @@ BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "If a command fails or is not enough, try another way before answering. "
     "Never guess what a command would print; run it. "
     "Never change files, images or containers unless the user asked for that exact change. "
+    "Installed commands, call them by name: "
+    "image-updates [name] reports newer versions and critical CVEs and changes nothing; "
+    "image-apply <service-or-image> [new-tag] updates one image when the user asks for it "
+    "(backs up the files, pulls, recreates); if it fails, read its message and fix the arguments. "
+    "The compose file is /root/compose/docker-compose.yml and both commands use it by default. "
     "When you have the answer, reply in short plain text. "
     "WhatsApp shows no tables or headings; use short lines and *bold* only."
 )

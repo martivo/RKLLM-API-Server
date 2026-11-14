@@ -146,12 +146,35 @@ def main():
         registry, repo, old_tag = target
         if new_tag == old_tag:
             sys.exit(f"{target_arg} already uses tag {new_tag}; nothing was changed.")
-        try:
-            iu.remote_image(registry, repo, new_tag)
-        except urllib.error.HTTPError as exc:
-            sys.exit(f"Tag {new_tag} does not exist for {repo} (HTTP {exc.code}); nothing was changed.")
-        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-            sys.exit(f"Could not verify tag {new_tag} ({exc}); nothing was changed.")
+        # "3.16.0" for an image tagged "v3.11.3" (or the reverse): accept either spelling.
+        other = new_tag[1:] if new_tag[:1] in "vV" else "v" + new_tag
+        found = None
+        for candidate in (new_tag, other):
+            try:
+                iu.remote_image(registry, repo, candidate)
+                found = candidate
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    sys.exit(f"Could not verify tag {candidate} (HTTP {exc.code}); nothing was changed.")
+            except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+                sys.exit(f"Could not verify tag {candidate} ({exc}); nothing was changed.")
+        if not found:
+            hint = ""
+            try:
+                newest, in_line = iu.newer_tags(old_tag, iu.list_tags(registry, repo))
+                names = [t for t in dict.fromkeys((in_line, newest)) if t]
+                if names:
+                    hint = f" Newer tags that exist: {', '.join(names)}."
+            except Exception:
+                pass
+            sys.exit(f"Tag {new_tag} does not exist for {repo} (current tag: {old_tag}).{hint} "
+                     "Nothing was changed.")
+        if found != new_tag:
+            print(f"Tag {new_tag} does not exist; using {found}.")
+            new_tag = found
+        if new_tag == old_tag:
+            sys.exit(f"{target_arg} already uses tag {new_tag}; nothing was changed.")
         changed = rewrite(compose_file, target, new_tag,
                           r"\s*image:\s*[\"']?(?P<ref>[^\"'\s#]+)", dry_run)
         for dockerfile in sorted({s["dockerfile"] for s in affected if s["context"] is not None}):
