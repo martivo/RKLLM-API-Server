@@ -219,6 +219,20 @@ BAD_CALL_HINT = (
 )
 
 
+MAX_BAD_CALLS = 3
+_SALVAGE_RE = re.compile(r"<tool_call>\s*(?:command|shell)\s*[:=]\s*(.+?)\s*(?:\n\s*<|</|\Z)", re.DOTALL)
+
+
+def salvage_command(content):
+    """Recover the command from a call written as '<tool_call> command: ls -l </parameter>...'.
+
+    Only this one shape is accepted (the argument name, then the value); any
+    other broken call is sent back to the model instead of being guessed at."""
+    m = _SALVAGE_RE.search(content)
+    command = m.group(1).strip() if m else ""
+    return command if command and "<tool_call" not in command else None
+
+
 class Agent:
     """One append-only conversation against the chat completions API."""
 
@@ -269,6 +283,7 @@ class Agent:
             raise
 
     def _steps(self, notify):
+        bad_calls = 0
         for _step in range(MAX_STEPS):
             msg = self._complete()
             if STOP.is_set():
@@ -277,10 +292,24 @@ class Agent:
             content = (msg.get("content") or "").strip()
             if not calls and _BAD_CALL_RE.search(content):
                 # The model tried to call a tool but the server could not parse it.
-                log.info("malformed tool call, asking again: %s", content)
-                self.history.append({"role": "assistant", "content": content})
-                self.history.append({"role": "user", "content": BAD_CALL_HINT})
-                continue
+                command = salvage_command(content)
+                if command:
+                    log.info("malformed tool call, recovered the command from: %s", content)
+                    calls = [{"id": f"call_{int(time.time() * 1000)}", "type": "function",
+                              "function": {"name": "shell",
+                                           "arguments": json.dumps({"command": command})}}]
+                    content = content[:_BAD_CALL_RE.search(content).start()].strip()
+                else:
+                    bad_calls += 1
+                    log.info("malformed tool call (%d): %s", bad_calls, content)
+                    if bad_calls >= MAX_BAD_CALLS:
+                        self.history.append({"role": "assistant", "content": content})
+                        self.last_used = time.time()
+                        return (f"The model failed to write a valid tool call {bad_calls} times, "
+                                "so nothing ran. Try again or send /new.")
+                    self.history.append({"role": "assistant", "content": content})
+                    self.history.append({"role": "user", "content": BAD_CALL_HINT})
+                    continue
             if not calls:
                 log.info("reply: %s", content)
                 self.history.append({"role": "assistant", "content": content})
