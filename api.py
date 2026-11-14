@@ -254,9 +254,9 @@ VL_MODEL_CONFIGS = {
 }
 
 # Timeouts
-GENERATION_TIMEOUT = 600
-FIRST_TOKEN_TIMEOUT = 300     # Max wait for first token (includes prefill on NPU)
-FALLBACK_SILENCE = 20         # Max silence between tokens after first token
+GENERATION_TIMEOUT  = int(os.environ.get("RKLLM_GENERATION_TIMEOUT", 3600))
+FIRST_TOKEN_TIMEOUT = int(os.environ.get("RKLLM_FIRST_TOKEN_TIMEOUT", 1800))
+FALLBACK_SILENCE    = int(os.environ.get("RKLLM_FALLBACK_SILENCE", 60))
 
 # Defaults
 MAX_TOKENS_DEFAULT = 2048
@@ -319,8 +319,8 @@ VL_ASSISTANT_HISTORY_CAP = 500  # Max chars per prior assistant answer in VL pro
 # Small models (4K context) degrade rapidly when history fills the context window.
 # We reserve a portion of context for the system prompt + current user turn +
 # model output, and fit as many recent turns as possible into the remainder.
-HISTORY_CONTEXT_RESERVE = 0.35  # Reserve 35% of context for current turn + output
-ASSISTANT_HISTORY_CAP = 1500    # Max chars per prior assistant answer in text prompts
+HISTORY_CONTEXT_RESERVE = 0.2  # Reserve 35% of context for current turn + output
+ASSISTANT_HISTORY_CAP = 6000    # Max chars per prior assistant answer in text prompts
 
 # Prompt cache: save/load KV state for system prompt tokens to skip re-prefill.
 # Cache files are stored as <model_dir>/prompt_cache.bin and loaded on model init.
@@ -3649,7 +3649,7 @@ def chat_completions():
     _has_tools = bool(_req_tools and isinstance(_req_tools, list) and _tool_choice != 'none')
     if _has_tools:
         _tools_defs = [t.get('function', t) for t in _req_tools if isinstance(t, dict)]
-        _tools_json = json.dumps(_tools_defs, ensure_ascii=False, indent=2)
+        _tools_json = json.dumps(_tools_defs, ensure_ascii=False, separators=(',',':'))
         _tool_sys_content = _TOOL_SYSTEM_TEMPLATE.format(tools_json=_tools_json)
         messages = [{'role': 'system', 'content': _tool_sys_content}] + messages
         logger.info(f"[{request_id}] Tool calling: {len(_tools_defs)} tool(s) injected")
