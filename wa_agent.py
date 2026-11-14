@@ -50,7 +50,7 @@ PREFIX = os.environ.get("AGENT_PREFIX", "").strip()
 NOTIFY_TO = os.environ.get("AGENT_NOTIFY_TO", "").strip().lstrip("+")
 MAX_STEPS = _env_int("AGENT_MAX_STEPS", 15)
 TOOL_TIMEOUT = _env_int("AGENT_TOOL_TIMEOUT", 900)
-TOOL_OUTPUT_CHARS = _env_int("AGENT_TOOL_OUTPUT_CHARS", 3000)
+TOOL_OUTPUT_CHARS = _env_int("AGENT_TOOL_OUTPUT_CHARS", 8000)
 HISTORY_CHARS = _env_int("AGENT_HISTORY_CHARS", 24000)
 NOTES_CHARS = _env_int("AGENT_NOTES_CHARS", 2000)
 SESSION_IDLE = _env_int("AGENT_SESSION_IDLE", 3600)
@@ -62,7 +62,8 @@ BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "If a command fails or is not enough, try another way before answering. "
     "Never guess what a command would print; run it. "
     "Never change files, images or containers unless the user asked for that exact change. "
-    "When you have the answer, reply in short plain text."
+    "When you have the answer, reply in short plain text. "
+    "WhatsApp shows no tables or headings; use short lines and *bold* only."
 )
 
 NOTES_FILE = os.path.join(DATA_DIR, "notes.md")

@@ -169,7 +169,7 @@ local time, set `TZ`). A new task first runs at its next scheduled time; use
 | `AGENT_SYSTEM_PROMPT` | ops assistant | system prompt; keep it short and constant |
 | `AGENT_MAX_STEPS` | `15` | model calls per message |
 | `AGENT_TOOL_TIMEOUT` | `900` | seconds per shell command |
-| `AGENT_TOOL_OUTPUT_CHARS` | `3000` | shell output kept (head and tail) |
+| `AGENT_TOOL_OUTPUT_CHARS` | `8000` | shell output kept (head and tail) |
 | `AGENT_NOTES_CHARS` | `2000` | notes included in the prompt (most recent part) |
 | `AGENT_HISTORY_CHARS` | `24000` | history size that triggers a new conversation |
 | `AGENT_SESSION_IDLE` | `3600` | idle seconds after which a new conversation starts |

@@ -169,6 +169,10 @@ def remote_image(registry, repo, tag):
     created = None
     config = manifest.get("config", {}).get("digest")
     if config:
+        # The config digest is the image ID docker shows.  It only changes when
+        # this platform's image changes, unlike the index digest, which also
+        # changes when another architecture or an attestation is re-pushed.
+        digests.add(config)
         with _open(f"https://{registry}/v2/{repo}/blobs/{config}", (registry, repo)) as resp:
             created = parse_time(json.loads(resp.read().decode()).get("created"))
     return digests, created
@@ -224,15 +228,16 @@ def docker(*args):
 
 
 def local_image(ref):
-    """Return (repo digests, creation time) of an image on this host, or None."""
-    out = docker("image", "inspect", "--format", "{{json .RepoDigests}}|{{.Created}}", ref)
+    """Return (image ID plus repo digests, creation time) of an image on this host, or None."""
+    out = docker("image", "inspect", "--format", "{{json .RepoDigests}}|{{.Id}}|{{.Created}}", ref)
     if out is None:
         return None
-    digests, _, created = out.partition("|")
+    digests, image_id, created = out.split("|", 2)
     try:
         digests = {d.split("@")[-1] for d in json.loads(digests) or []}
     except ValueError:
         digests = set()
+    digests.add(image_id)
     return digests, parse_time(created)
 
 
