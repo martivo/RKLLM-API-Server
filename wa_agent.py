@@ -48,7 +48,7 @@ WORKDIR = os.environ.get("AGENT_WORKDIR", "/root")
 ALLOW_FROM = {n.strip().lstrip("+") for n in os.environ.get("AGENT_ALLOW_FROM", "").split(",") if n.strip()}
 PREFIX = os.environ.get("AGENT_PREFIX", "").strip()
 NOTIFY_TO = os.environ.get("AGENT_NOTIFY_TO", "").strip().lstrip("+")
-MAX_STEPS = _env_int("AGENT_MAX_STEPS", 8)
+MAX_STEPS = _env_int("AGENT_MAX_STEPS", 15)
 TOOL_TIMEOUT = _env_int("AGENT_TOOL_TIMEOUT", 900)
 TOOL_OUTPUT_CHARS = _env_int("AGENT_TOOL_OUTPUT_CHARS", 3000)
 HISTORY_CHARS = _env_int("AGENT_HISTORY_CHARS", 24000)
@@ -58,7 +58,8 @@ REQUEST_TIMEOUT = _env_int("AGENT_REQUEST_TIMEOUT", 3600)
 PROGRESS = os.environ.get("AGENT_PROGRESS", "1") == "1"
 BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "You are a Linux ops assistant answering over WhatsApp. "
-    "Use the shell tool to inspect the system, one command at a time. "
+    "Use the shell tool to investigate, one command at a time. "
+    "If a command fails or is not enough, try another way before answering. "
     "Never guess what a command would print; run it. "
     "Never change files, images or containers unless the user asked for that exact change. "
     "When you have the answer, reply in short plain text."
@@ -336,8 +337,7 @@ def due_tasks(now=None):
 
 def task_prompt(name):
     _schedule, body = load_task(name)
-    prompt = (f"Scheduled task '{name}'. Carry it out now. Where the instructions name a "
-              f"command, run exactly that command.\n\nInstructions:\n{body}")
+    prompt = f"Scheduled task '{name}'. Carry it out now.\n\nInstructions:\n{body}"
     learned = _read(_task_path(name, ".notes")).strip()
     if learned:
         prompt += f"\n\nWhat you learned on earlier runs:\n{_tail(learned, NOTES_CHARS)}"

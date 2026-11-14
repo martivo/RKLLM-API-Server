@@ -167,7 +167,7 @@ local time, set `TZ`). A new task first runs at its next scheduled time; use
 | `AGENT_PREFIX` | empty | keyword a message must start with (case-insensitive) |
 | `AGENT_NOTIFY_TO` | self chat | phone number that receives scheduled task reports |
 | `AGENT_SYSTEM_PROMPT` | ops assistant | system prompt; keep it short and constant |
-| `AGENT_MAX_STEPS` | `8` | model calls per message |
+| `AGENT_MAX_STEPS` | `15` | model calls per message |
 | `AGENT_TOOL_TIMEOUT` | `900` | seconds per shell command |
 | `AGENT_TOOL_OUTPUT_CHARS` | `3000` | shell output kept (head and tail) |
 | `AGENT_NOTES_CHARS` | `2000` | notes included in the prompt (most recent part) |
