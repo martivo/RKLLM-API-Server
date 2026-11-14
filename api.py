@@ -1879,15 +1879,52 @@ LAST_REQUEST_TIME = 0
 _KV_LOCK = Lock()
 _kv_cache_state = {
     "model": None,               # Model name currently in KV cache
-    "user_messages": [],         # User messages (in order) the KV cache covers
+    "user_messages": [],         # Input turns (user messages + tool results, in order) the KV cache covers
     "system_prompt_hash": None,  # Hash of system prompt(s) in the cached context
 }
 
 
-def _check_kv_incremental(model_name, messages):
-    """Check if KV cache allows incremental mode (send only last user message).
+def _kv_input_turns(messages):
+    """Return (inputs, trailing) for KV tracking.
 
-    Returns the last user message text if incremental is possible, else None.
+    inputs:   every turn the *client* contributes, in order — user messages
+              and tool results (formatted exactly as build_prompt formats them).
+    trailing: how many of those come after the last assistant message, i.e.
+              the turns the runtime has not seen yet.
+    """
+    inputs = []
+    trailing = 0
+    for m in messages:
+        role = m.get('role')
+        content = m.get('content')
+        if role == 'assistant':
+            trailing = 0
+        elif role in ('tool', 'function'):
+            if not isinstance(content, str):
+                content = '' if content is None else str(content)
+            inputs.append(f'<tool_response>\n{content}\n</tool_response>')
+            trailing += 1
+        elif role == 'user' and isinstance(content, str) and content:
+            inputs.append(content)
+            trailing += 1
+    return inputs, trailing
+
+
+def _system_hash(messages):
+    _sys_parts = tuple(m.get('content', '') for m in messages
+                       if m.get('role') == 'system' and m.get('content'))
+    return hashlib.sha256("\n".join(_sys_parts).encode()).hexdigest()[:16]
+
+
+def _check_kv_incremental(model_name, messages):
+    """Check if KV cache allows incremental mode (send only the new turns).
+
+    Returns the text to send (the new user message and/or tool results that
+    follow the last assistant turn) if incremental is possible, else None.
+
+    Tool results count as turns: in an agent loop the follow-up request is
+    [..., assistant(tool_calls), tool(result)] with no new user message, and
+    it must not force a full re-prefill of the system prompt + tool schemas.
     """
     with _KV_LOCK:
         if _kv_cache_state["model"] != model_name:
@@ -1895,10 +1932,7 @@ def _check_kv_incremental(model_name, messages):
 
         # System prompt must match exactly — a different persona or instruction
         # set means the cached KV state is wrong for the new request.
-        _sys_parts = tuple(m.get('content', '') for m in messages
-                           if m.get('role') == 'system' and m.get('content'))
-        _sys_hash = hashlib.sha256("\n".join(_sys_parts).encode()).hexdigest()[:16]
-        if _sys_hash != _kv_cache_state["system_prompt_hash"]:
+        if _system_hash(messages) != _kv_cache_state["system_prompt_hash"]:
             return None
 
         # If any user turn has multimodal (list) content, disable incremental mode —
@@ -1907,37 +1941,42 @@ def _check_kv_incremental(model_name, messages):
         if any(m.get('role') == 'user' and isinstance(m.get('content'), list)
                for m in messages):
             return None
-        user_msgs = [m['content'] for m in messages
-                     if m.get('role') == 'user' and isinstance(m.get('content'), str)
-                     and m.get('content')]
-        if not user_msgs:
+
+        inputs, trailing = _kv_input_turns(messages)
+        if trailing < 1:
+            return None
+        # The request must end with the new turn(s); a trailing assistant
+        # message (prefill) cannot be expressed incrementally.
+        _last = next((m for m in reversed(messages) if m.get('role') != 'system'), None)
+        if _last is None or _last.get('role') == 'assistant':
             return None
 
-        # History = all user messages except the latest
-        history = user_msgs[:-1]
+        # Everything before the new turn(s) must be exactly what the KV holds.
+        if inputs[:-trailing] != _kv_cache_state["user_messages"]:
+            return None
 
-        if history == _kv_cache_state["user_messages"]:
-            return user_msgs[-1]
-        return None
+        # The KV cache only grows in incremental mode.  Once the conversation
+        # no longer fits the history budget, fall back to a reset so
+        # build_prompt's sliding window trims it.
+        _cfg = MODELS.get(model_name) or {}
+        _ctx = _cfg.get('context_length', CONTEXT_LENGTH_DEFAULT)
+        _all_text = "\n".join(m.get('content') for m in messages
+                              if isinstance(m.get('content'), str))
+        if _count_tokens(_all_text, model_name) > int(_ctx * (1 - HISTORY_CONTEXT_RESERVE)):
+            return None
+
+        return "\n".join(inputs[-trailing:])
 
 
 def _update_kv_tracking(model_name, messages, is_reset):
     """Update KV cache tracking after successful generation."""
-    user_msgs = [m['content'] for m in messages
-                 if m.get('role') == 'user' and isinstance(m.get('content'), str)
-                 and m.get('content')]
-    _sys_parts = tuple(m.get('content', '') for m in messages
-                       if m.get('role') == 'system' and m.get('content'))
+    inputs, _ = _kv_input_turns(messages)
     with _KV_LOCK:
         _kv_cache_state["model"] = model_name
-        _kv_cache_state["system_prompt_hash"] = hashlib.sha256("\n".join(_sys_parts).encode()).hexdigest()[:16]
-        if is_reset:
-            # Full reset — track all user messages from this conversation
-            _kv_cache_state["user_messages"] = list(user_msgs)
-        else:
-            # Incremental — append only the latest user message (cap at 50 to prevent unbounded growth)
-            if user_msgs:
-                _kv_cache_state["user_messages"] = _kv_cache_state["user_messages"][-49:] + [user_msgs[-1]]
+        _kv_cache_state["system_prompt_hash"] = _system_hash(messages)
+        # After a clean run (reset or incremental) the KV holds every input
+        # turn of this request plus the answer just generated.
+        _kv_cache_state["user_messages"] = inputs
 
 
 def _reset_kv_tracking():
@@ -4235,8 +4274,8 @@ def chat_completions():
         else:
             incremental_msg = _check_kv_incremental(name, messages)
             if incremental_msg is not None:
-                logger.info(f"[{request_id}] KV INCREMENTAL — sending only latest "
-                            f"user message ({len(incremental_msg)} chars "
+                logger.info(f"[{request_id}] KV INCREMENTAL — sending only new "
+                            f"turn(s) ({len(incremental_msg)} chars "
                             f"vs {len(prompt)} full)")
                 if _PROMETHEUS_AVAILABLE:
                     rkllm_kv_cache_result.labels(result="incremental").inc()
