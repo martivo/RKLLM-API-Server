@@ -38,10 +38,23 @@ saved as `qr.png` in the agent volume). Scan it in WhatsApp under
   (comma-separated, digits only, with country code). Rejected senders are
   logged with the ID to add.
 - Group messages are ignored.
+- With `AGENT_PREFIX` set (for example `bot`), only messages starting with
+  that word are handled, and the word is removed: `bot /status`,
+  `bot check the disk`. Everything else is ignored silently.
 
 The shell tool runs as root inside the container, and this container is
 normally privileged. Anyone who can message the agent can run commands on the
 host. Keep the allow list short.
+
+## Docker
+
+The image contains the `docker` CLI and the compose plugin, but no daemon. To
+let the agent inspect or manage containers, mount the host socket:
+
+```yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+```
 
 ## Commands
 
@@ -91,6 +104,7 @@ local time, set `TZ`). A new task first runs at its next scheduled time; use
 | `AGENT_ENABLED` | `0` | start the agent next to the API server |
 | `AGENT_MODEL` | first model listed | model to use |
 | `AGENT_ALLOW_FROM` | empty | extra phone numbers allowed to message the agent |
+| `AGENT_PREFIX` | empty | keyword a message must start with (case-insensitive) |
 | `AGENT_NOTIFY_TO` | self chat | phone number that receives scheduled task reports |
 | `AGENT_SYSTEM_PROMPT` | ops assistant | system prompt; keep it short and constant |
 | `AGENT_MAX_STEPS` | `8` | model calls per message |

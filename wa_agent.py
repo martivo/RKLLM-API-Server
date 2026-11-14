@@ -46,6 +46,7 @@ MODEL = os.environ.get("AGENT_MODEL", "")
 DATA_DIR = os.environ.get("AGENT_DATA_DIR", "/root/agent")
 WORKDIR = os.environ.get("AGENT_WORKDIR", "/root")
 ALLOW_FROM = {n.strip().lstrip("+") for n in os.environ.get("AGENT_ALLOW_FROM", "").split(",") if n.strip()}
+PREFIX = os.environ.get("AGENT_PREFIX", "").strip()
 NOTIFY_TO = os.environ.get("AGENT_NOTIFY_TO", "").strip().lstrip("+")
 MAX_STEPS = _env_int("AGENT_MAX_STEPS", 8)
 TOOL_TIMEOUT = _env_int("AGENT_TOOL_TIMEOUT", 120)
@@ -88,6 +89,19 @@ HELP = (
     "/task show|run|rm <name>\n"
     "Schedules: every 30m, every 6h, every 2d, daily 08:00"
 )
+
+
+def strip_prefix(text):
+    """Return the message without AGENT_PREFIX, or None if it is not addressed
+    to the agent.  With no prefix configured every message is."""
+    if not PREFIX:
+        return text
+    if text[:len(PREFIX)].lower() != PREFIX.lower():
+        return None
+    rest = text[len(PREFIX):]
+    if rest and not rest[0].isspace() and rest[0] not in ",:" and PREFIX[-1].isalnum():
+        return None  # "botany ..." is not "bot ..."
+    return rest.lstrip(" \t,:").strip() or None
 
 
 def _read(path, default=""):
@@ -506,7 +520,7 @@ def run_whatsapp(core):
             ts /= 1000
         if ts and ts < started - 600:
             return  # backlog delivered on reconnect
-        text = (extract_text(ev.Message) or "").strip()
+        text = strip_prefix((extract_text(ev.Message) or "").strip())
         if not text:
             return
         if src.IsFromMe:

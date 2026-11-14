@@ -38,6 +38,11 @@ RUN pip install --no-cache-dir \
     prometheus-client \
     neonize==0.10.0
 
+# Docker CLI + compose plugin for the agent's shell tool (client only; mount
+# /var/run/docker.sock to use it)
+COPY --from=docker:29.9.3-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:29.9.3-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+
 WORKDIR /app
 
 COPY api.py gunicorn.config.py healthcheck.py wa_agent.py entrypoint.sh ./
