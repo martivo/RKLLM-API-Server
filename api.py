@@ -977,6 +977,25 @@ RKLLM_RT_VERSION = _parse_rt_version(os.environ.get("RKLLM_VERSION", "v1.2.3"))
 _RT_13 = RKLLM_RT_VERSION >= (1, 3)
 
 
+def _wants_explicit_chatml(model_path):
+    """Whether to set the chat template ourselves instead of letting the
+    runtime parse the one embedded in the model.
+
+    Runtime 1.3.1 cannot derive a follow-up turn from Qwen3.5's template
+    ("Chat template auto-parsing failed" on every turn after the first), which
+    breaks KV-incremental mode.  model_config.json can force either way with
+    "chat_template": "chatml" or "auto".
+    """
+    try:
+        with open(os.path.join(os.path.dirname(model_path), 'model_config.json')) as fh:
+            choice = json.load(fh).get('chat_template')
+        if choice in ('chatml', 'auto'):
+            return choice == 'chatml'
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 'qwen3.5' in model_path.lower()
+
+
 class RKLLMParam(ctypes.Structure):
     _fields_ = [
         ("model_path", ctypes.c_char_p),
@@ -1689,6 +1708,9 @@ class RKLLMWrapper:
         if sampling is None:
             sampling = dict(_SAMPLING_DEFAULTS_INIT)
 
+        self._chatml = _wants_explicit_chatml(model_path)
+        self._chatml_postfix = None
+
         param = RKLLMParam()
         param.model_path = model_path.encode('utf-8')
         param.max_context_len = ctx_len
@@ -1742,6 +1764,24 @@ class RKLLMWrapper:
         self._model_loaded = True
         return True
 
+    def _apply_chatml(self, enable_thinking):
+        """Set an explicit ChatML template (see _wants_explicit_chatml).
+
+        The assistant turn is opened the way Qwen3.5's own template does it:
+        '<think>\\n' when thinking, an empty think block when not.  Called
+        before every run, but only talks to the runtime when the mode changes.
+        """
+        postfix = b"<|im_end|>\n<|im_start|>assistant\n" + (
+            b"<think>\n" if enable_thinking else b"<think>\n\n</think>\n\n")
+        if postfix == self._chatml_postfix or not hasattr(self.lib, 'rkllm_set_chat_template'):
+            return
+        ret = self.lib.rkllm_set_chat_template(self.handle, b"", b"<|im_start|>user\n", postfix)
+        if ret != 0:
+            logger.warning(f"rkllm_set_chat_template returned {ret}")
+        else:
+            logger.info(f"Explicit ChatML chat template set (thinking={enable_thinking})")
+        self._chatml_postfix = postfix
+
     def load_prompt_cache(self, cache_path):
         """Load a saved prompt cache from disk into the runtime.
 
@@ -1789,6 +1829,8 @@ class RKLLMWrapper:
         """
         if not self._model_loaded:
             return -1
+        if self._chatml:
+            self._apply_chatml(enable_thinking)
 
         rkllm_input = RKLLMInput()
         rkllm_input.role = role.encode('utf-8')
@@ -2057,14 +2099,7 @@ def _check_kv_incremental(model_name, messages):
         if _count_tokens(_all_text, model_name) > int(_ctx * (1 - HISTORY_CONTEXT_RESERVE)):
             return None
 
-        text = "\n".join(inputs[-trailing:])
-        # Qwen3.5's chat template raises "no user query" for a user turn that
-        # is exactly a <tool_response> block, and the runtime then fails with
-        # "Chat template auto-parsing failed".  A leading newline keeps the
-        # rendered turn the same apart from one blank line.
-        if text.startswith('<tool_response>'):
-            text = "\n" + text
-        return text
+        return "\n".join(inputs[-trailing:])
 
 
 def _update_kv_tracking(model_name, messages, is_reset):
@@ -4623,6 +4658,8 @@ def _generate_stream(prompt, request_id, model_name, created,
     request_ended = False
     stats_data = {}
     think_parser = ThinkTagParser()
+    if enable_thinking and getattr(_active_wrapper, '_chatml', False):
+        think_parser.in_thinking = True   # the template already opened <think>
     try:
         update_request_activity()  # Refresh after model load delay
 
@@ -5137,6 +5174,9 @@ def _generate_complete(prompt, request_id, model_name, created,
                 })
 
         # Parse think tags
+        if (enable_thinking and getattr(_active_wrapper, '_chatml', False)
+                and '<think>' not in full_content):
+            full_content = '<think>' + full_content   # the template already opened it
         reasoning_content, cleaned_content = parse_think_tags(full_content)
 
         # Token counts: exact prefill from NPU stats, tiktoken for prompt estimate
