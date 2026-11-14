@@ -419,6 +419,22 @@ _TOOL_SYSTEM_TEMPLATE_XML = (
 )
 
 
+LOG_IO = os.environ.get('RKLLM_LOG_IO', '1') == '1'
+LOG_IO_CHARS = int(os.environ.get('RKLLM_LOG_IO_CHARS', 6000))
+
+
+def _log_io(request_id, label, text):
+    """Log the exact text sent to or received from the model (RKLLM_LOG_IO=0 turns it off)."""
+    if not LOG_IO:
+        return
+    text = text or ''
+    if len(text) > LOG_IO_CHARS:
+        half = LOG_IO_CHARS // 2
+        text = f"{text[:half]}\n[... {len(text) - 2 * half} chars not logged ...]\n{text[-half:]}"
+    logging.getLogger(__name__).info(
+        f"[{request_id}] {label} ({len(text)} chars):\n----\n{text}\n----")
+
+
 def _uses_xml_tool_calls(model_name):
     """True for models whose native tool-call syntax is <function=...> (Qwen3.5)."""
     return 'qwen3.5' in (model_name or '').lower()
@@ -3150,7 +3166,8 @@ def load_model(model_name, config):
 
         sampling = config.get('sampling')
 
-        logger.info(f"STARTING LOAD of {model_name} (ctx={ctx_len}, max_tok={max_tokens})...")
+        logger.info(f"STARTING LOAD of {model_name} (ctx={ctx_len}, max_tok={max_tokens}, "
+                    f"sampling={sampling})...")
         load_start = time.time()
 
         if not _rkllm_wrapper.init_model(model_path, ctx_len, max_tokens, sampling=sampling):
@@ -4633,6 +4650,7 @@ def _generate_stream(prompt, request_id, model_name, created,
     logger.info(f"[{request_id}] Starting STREAMING generation "
                 f"(rag={is_rag}, keep_history={keep_history}, thinking={enable_thinking}"
                 f"{', VL=True' if _is_vl else ''})")
+    _log_io(request_id, "MODEL INPUT", prompt)
 
     # Clear any stale items from the token queue
     while not _token_queue.empty():
@@ -4868,6 +4886,8 @@ def _generate_stream(prompt, request_id, model_name, created,
                     yield make_sse_chunk(request_id, model_name, created,
                                          delta={"content": flush_text})
 
+        _log_io(request_id, "MODEL OUTPUT (thinking)", total_reasoning)
+        _log_io(request_id, "MODEL OUTPUT (content)", total_content)
         # Tool call detection — if tools were active and model output a <tool_call>,
         # emit a structured tool_calls response instead of a normal content response.
         if has_tools and generation_clean:
@@ -5029,6 +5049,7 @@ def _generate_complete(prompt, request_id, model_name, created,
     logger.info(f"[{request_id}] Starting NON-STREAMING generation "
                 f"(rag={is_rag}, keep_history={keep_history}, thinking={enable_thinking}"
                 f"{', VL=True' if _is_vl else ''})")
+    _log_io(request_id, "MODEL INPUT", prompt)
 
     # Clear stale queue items
     while not _token_queue.empty():
@@ -5197,6 +5218,7 @@ def _generate_complete(prompt, request_id, model_name, created,
         request_ended = True
 
         full_content = "".join(content_parts).rstrip()
+        _log_io(request_id, "MODEL OUTPUT (raw)", full_content)
 
         # Tool call detection — check BEFORE stripping think tags
         if has_tools and generation_clean:

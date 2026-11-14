@@ -259,6 +259,7 @@ class Agent:
             notes.append("(context was full, started a new conversation)")
         self.last_used = now
 
+        log.info("user: %s", text)
         start = len(self.history)
         self.history.append({"role": "user", "content": text})
         try:
@@ -276,11 +277,12 @@ class Agent:
             content = (msg.get("content") or "").strip()
             if not calls and _BAD_CALL_RE.search(content):
                 # The model tried to call a tool but the server could not parse it.
-                log.info("malformed tool call, asking again: %s", content[:200])
+                log.info("malformed tool call, asking again: %s", content)
                 self.history.append({"role": "assistant", "content": content})
                 self.history.append({"role": "user", "content": BAD_CALL_HINT})
                 continue
             if not calls:
+                log.info("reply: %s", content)
                 self.history.append({"role": "assistant", "content": content})
                 self.last_used = time.time()
                 return content or "(empty answer)"
@@ -302,6 +304,8 @@ class Agent:
                     if PROGRESS:
                         notify(f"$ {command}")
                     result = run_shell(command)
+                    log.info("shell output (%d chars): %s", len(result),
+                             result if len(result) <= 2000 else result[:1000] + "\n[...]\n" + result[-1000:])
                     if STOP.is_set():
                         raise Stopped()
                 self.history.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
