@@ -4672,6 +4672,10 @@ def _generate_stream(prompt, request_id, model_name, created,
             _tool_calls = _parse_tool_calls(total_content)
             if _tool_calls:
                 logger.info(f"[{request_id}] Tool call detected: {[c['function']['name'] for c in _tool_calls]}")
+                # A tool-call turn is a clean generation too: record it, or the
+                # follow-up carrying the tool result can never go incremental.
+                if not is_rag and not _is_vl and messages:
+                    _update_kv_tracking(model_name, messages, is_reset=kv_is_reset)
                 # Emit tool_calls delta (OpenAI streaming format)
                 _tc_delta = {"role": "assistant", "content": None, "tool_calls": [
                     {"index": i, "id": c["id"], "type": "function",
@@ -4987,6 +4991,10 @@ def _generate_complete(prompt, request_id, model_name, created,
             _tool_calls = _parse_tool_calls(full_content)
             if _tool_calls:
                 logger.info(f"[{request_id}] Tool call detected: {[c['function']['name'] for c in _tool_calls]}")
+                # A tool-call turn is a clean generation too: record it, or the
+                # follow-up carrying the tool result can never go incremental.
+                if not is_rag and not _is_vl and messages:
+                    _update_kv_tracking(model_name, messages, is_reset=kv_is_reset)
                 prompt_text = "".join(m.get("content", "") for m in (messages or [])
                                       if isinstance(m.get("content"), str))
                 _pt = stats_data.get('prefill_tokens') or _count_tokens(prompt, model_name)

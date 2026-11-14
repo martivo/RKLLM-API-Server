@@ -46,6 +46,8 @@ COPY --from=docker:29.9.3-cli /usr/local/libexec/docker/cli-plugins/docker-compo
 WORKDIR /app
 
 COPY api.py gunicorn.config.py healthcheck.py wa_agent.py entrypoint.sh ./
+# Helper commands for the agent's shell tool
+COPY --chmod=755 tools/image-updates /usr/local/bin/image-updates
 
 # Models are mounted at runtime — do not bake into image
 VOLUME /root/models

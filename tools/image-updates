@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""List newer tags for the images a docker compose file uses.
+
+    image-updates [compose-file]
+
+Checks every `image:` line and every `FROM` line of the Dockerfiles in the
+compose file's build contexts against the image's registry.  A tag is only
+compared with tags of the same shape (3.3.17 with 3.3.19 and 3.4.2, never with
+3.4-alpine), so the suggestion is always a like-for-like replacement.
+
+The output is short on purpose: it is meant to be read by a small local model.
+"""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+TIMEOUT = 20
+MAX_PAGES = 30
+
+
+def find_images(compose_path):
+    """Return {image_ref: where_it_is_used} from the compose file and its Dockerfiles."""
+    base = os.path.dirname(os.path.abspath(compose_path))
+    found = {}
+    contexts = []
+    with open(compose_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.split(" #")[0].rstrip()
+            m = re.match(r"\s*image:\s*[\"']?([^\"'\s]+)", line)
+            if m:
+                found.setdefault(m.group(1), "compose")
+            m = re.match(r"\s*(?:build|context):\s*[\"']?([^\"'\s{]+)", line)
+            if m:
+                contexts.append(m.group(1))
+    for ctx in contexts:
+        dockerfile = os.path.join(base, ctx, "Dockerfile")
+        try:
+            with open(dockerfile, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = (re.match(r"\s*FROM\s+(?:--\S+\s+)*(\S+)", line, re.IGNORECASE)
+                         or re.match(r"\s*COPY\s+.*--from=(\S*[:/]\S*)", line, re.IGNORECASE))
+                    if m and "$" not in m.group(1) and m.group(1).lower() != "scratch":
+                        found.setdefault(m.group(1), os.path.join(ctx, "Dockerfile"))
+        except OSError:
+            pass
+    return found
+
+
+def parse_ref(ref):
+    """'haproxy:3.3.17' -> ('registry-1.docker.io', 'library/haproxy', '3.3.17')."""
+    ref = ref.split("@")[0]
+    first, _, rest = ref.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, path = first, rest
+    else:
+        registry, path = "docker.io", ref
+    repo, _, tag = path.partition(":")
+    if registry in ("docker.io", "index.docker.io"):
+        registry = "registry-1.docker.io"
+        if "/" not in repo:
+            repo = "library/" + repo
+    return registry, repo, tag
+
+
+def _get(url, token=None):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=TIMEOUT)
+
+
+def list_tags(registry, repo):
+    """All tags of a repository, using the anonymous registry token flow."""
+    url = f"https://{registry}/v2/{repo}/tags/list?n=1000"
+    token = None
+    tags = []
+    for _page in range(MAX_PAGES):
+        try:
+            resp = _get(url, token)
+        except urllib.error.HTTPError as exc:
+            challenge = exc.headers.get("WWW-Authenticate", "")
+            if exc.code != 401 or token or not challenge.lower().startswith("bearer"):
+                raise
+            params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+            query = "&".join(f"{k}={urllib.request.quote(v, safe='')}"
+                             for k, v in params.items() if k in ("service", "scope"))
+            with _get(f"{params['realm']}?{query}") as tresp:
+                tdata = json.loads(tresp.read().decode())
+            token = tdata.get("token") or tdata.get("access_token")
+            resp = _get(url, token)
+        with resp:
+            tags += json.loads(resp.read().decode()).get("tags") or []
+            link = resp.headers.get("Link", "")
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not m:
+            break
+        url = m.group(1) if m.group(1).startswith("http") else f"https://{registry}{m.group(1)}"
+    return tags
+
+
+def shape(tag):
+    """Split a tag into its fixed text and its numbers: 'v1.2-alpine' -> (('v','.','-alpine'), (1,2))."""
+    parts = re.split(r"(\d+)", tag)
+    return tuple(parts[0::2]), tuple(int(n) for n in parts[1::2])
+
+
+def newer_tags(tag, tags):
+    """Return (newest overall, newest on the same release line), each or None.
+
+    The release line is everything but the last number: 3.3.x for 3.3.17,
+    11.x for 11.4."""
+    text, nums = shape(tag)
+    if not nums:
+        return None, None
+    same = [(shape(t)[1], t) for t in tags if shape(t)[0] == text and len(shape(t)[1]) == len(nums)]
+    # A date-like number (20260223) next to a version must stay date-like.
+    same = [(n, t) for n, t in same if all(len(str(a)) == len(str(b)) or a < 10000 for a, b in zip(n, nums))]
+    newer = sorted(x for x in same if x[0] > nums)
+    if not newer:
+        return None, None
+    line = nums[:-1] if len(nums) > 1 else nums
+    in_line = [x for x in newer if x[0][:len(line)] == line]
+    return newer[-1][1], (in_line[-1][1] if in_line else None)
+
+
+def main():
+    compose = sys.argv[1] if len(sys.argv) > 1 else "/root/compose/docker-compose.yml"
+    try:
+        images = find_images(compose)
+    except OSError as exc:
+        sys.exit(f"Cannot read {compose}: {exc}")
+    current = 0
+    updates, skipped = [], []
+    for ref, where in sorted(images.items()):
+        registry, repo, tag = parse_ref(ref)
+        src = "" if where == "compose" else f" (FROM in {where})"
+        if not tag or not re.search(r"\d", tag):
+            skipped.append(f"{ref}{src}: tag '{tag or 'latest'}' is not a version, cannot compare")
+            continue
+        try:
+            newest, in_line = newer_tags(tag, list_tags(registry, repo))
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            skipped.append(f"{ref}{src}: registry lookup failed ({exc}); local build?")
+            continue
+        if not newest:
+            current += 1
+        elif in_line and in_line != newest:
+            updates.append(f"{ref}{src}: same series {in_line}, newest {newest}")
+        elif in_line:
+            updates.append(f"{ref}{src}: same series {newest}")
+        else:
+            updates.append(f"{ref}{src}: newest {newest}")
+    print(f"UPDATES AVAILABLE ({len(updates)}):" if updates else "No updates available.")
+    print("\n".join(updates))
+    print(f"Up to date: {current} image(s).")
+    if skipped:
+        print(f"NOT CHECKED ({len(skipped)}):\n" + "\n".join(skipped))
+
+
+if __name__ == "__main__":
+    main()

@@ -59,6 +59,7 @@ PROGRESS = os.environ.get("AGENT_PROGRESS", "1") == "1"
 BASE_PROMPT = os.environ.get("AGENT_SYSTEM_PROMPT") or (
     "You are a Linux ops assistant answering over WhatsApp. "
     "Use the shell tool to inspect the system, one command at a time. "
+    "Never guess what a command would print; run it. "
     "When you have the answer, reply in short plain text."
 )
 
@@ -161,8 +162,8 @@ def run_shell(command):
 def build_system_prompt():
     """Base prompt plus the notes file.  Built once per conversation so the
     prompt stays constant (and the KV cache valid) while the agent edits notes."""
-    prompt = (f"{BASE_PROMPT}\nTo remember a fact for later conversations, append a line to "
-              f"{NOTES_FILE}.")
+    prompt = (f"{BASE_PROMPT}\nOnly when the user asks you to remember something, run: "
+              f"echo '- the fact' >> {NOTES_FILE}")
     notes = _read(NOTES_FILE).strip()
     if notes:
         prompt += f"\n\nYour notes:\n{_tail(notes, NOTES_CHARS)}"

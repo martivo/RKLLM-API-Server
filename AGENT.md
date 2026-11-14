@@ -56,6 +56,19 @@ let the agent inspect or manage containers, mount the host socket:
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
+## Helper commands
+
+A 4B model cannot work out how to query an image registry, so jobs like that
+are shipped as commands the model only has to run and summarise.
+
+- `image-updates [compose-file]` lists newer tags for every `image:` in a
+  compose file and every `FROM` / `COPY --from` in its build contexts. Tags
+  are only compared like-for-like (`3.3.17` with `3.3.19` and `3.4.2`, never
+  with `3.4-alpine`); `latest` and other non-version tags are reported as not
+  checked. Default file: `/root/compose/docker-compose.yml`.
+
+Tell the agent about a helper once with `/note`, or name it in a task.
+
 ## Commands
 
 Commands are handled by the agent itself, so they are instant and never touch
@@ -72,7 +85,7 @@ the model.
 
 `notes.md` in the agent volume is added to the system prompt of every new
 conversation, so standing facts do not have to be repeated. `/note` appends
-to it, and the model is told it can append to the file itself. Keep it short:
+to it, and the model appends to it when you ask it to remember something. Keep it short:
 every 30 tokens of notes cost about a second on each new conversation.
 
 ## Scheduled tasks
@@ -81,7 +94,7 @@ A task is a file `tasks/<name>.md` in the agent volume: a `schedule:` line and
 free-text instructions.
 
 ```
-/task add image-updates daily 08:00 | Check whether the images in /root/compose/docker-compose.yml have newer versions. List them with: grep -n image: /root/compose/docker-compose.yml
+/task add image-updates daily 08:00 | Run: image-updates /root/compose/docker-compose.yml and report the updates it lists. If it lists none, reply NOTHING.
 ```
 
 Schedules are `every 30m`, `every 6h`, `every 2d` or `daily HH:MM` (container
